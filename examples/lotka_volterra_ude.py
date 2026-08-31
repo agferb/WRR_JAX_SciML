@@ -61,13 +61,13 @@ def main(steps: int, n_points: int, t_end: float, length: int, stride: int, seed
     print(f"Closure relative error:      {rel[0]:.1%}, {rel[1]:.1%}\n")
 
     # --- 3. recover the closure symbolically ------------------------------
-    theta, names = sindy.polynomial_library(ys, degree=2, var_names=["x", "z"])
-    xi = sindy.stlsq(theta, learned, threshold=0.15)
+    model_sindy = sindy.SINDy(n_states=2, degree=2, var_names=["x", "z"])
+    model_sindy.solve(ys, learned, threshold=0.15)
 
     print("SINDy recovery of the neural closure:")
-    print(sindy.format_equations(xi, names, target_names=["closure_x", "closure_z"]))
-    print(f"\nGround truth:  dclosure_x/dt = {-TRUE['beta']:+.4f} x z")
-    print(f"               dclosure_z/dt = {TRUE['gamma']:+.4f} x z")
+    print(model_sindy.equations(target_names=["closure_x", "closure_z"]))
+    print(f"\nGround truth:  dclosure_x/dt = {-TRUE['beta']:+.4f} x*z")
+    print(f"               dclosure_z/dt = {TRUE['gamma']:+.4f} x*z")
 
 
 if __name__ == "__main__":

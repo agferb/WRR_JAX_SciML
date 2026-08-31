@@ -103,13 +103,32 @@ def test_sindy_recovers_a_known_system():
     X = jax.random.uniform(key, (200, 2), minval=0.5, maxval=2.0)
     dX = jnp.stack([-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1]], axis=1)
 
-    theta, names = sindy.polynomial_library(X, degree=2, var_names=["x", "z"])
-    xi = sindy.stlsq(theta, dX, threshold=0.1)
+    model = sindy.SINDy(n_states=2, degree=2, var_names=["x", "z"])
+    xi = model.solve(X, dX, threshold=0.1)
+    names = model.feature_names
 
     assert xi[names.index("x"), 0] == pytest.approx(-2.0, abs=1e-3)
-    assert xi[names.index("x z"), 0] == pytest.approx(3.0, abs=1e-3)
+    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
     assert xi[names.index("z"), 1] == pytest.approx(1.5, abs=1e-3)
     assert xi[names.index("1"), 1] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_sindy_solve_is_jittable():
+    X = jax.random.uniform(jax.random.key(1), (50, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
+    model = sindy.SINDy(n_states=2, degree=2)
+    theta = model._build_theta(X)
+    xi = jax.jit(sindy._stlsq, static_argnames=("n_iters",))(theta, dX, 0.1, 20)
+    chex.assert_tree_all_finite(xi)
+
+
+def test_sindy_all_pruned_returns_finite_zeros():
+    X = jax.random.uniform(jax.random.key(2), (50, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
+    model = sindy.SINDy(n_states=2, degree=2)
+    xi = model.solve(X, dX, threshold=1e6)  # threshold prunes every term
+    chex.assert_tree_all_finite(xi)
+    assert bool(jnp.all(xi == 0))
 
 
 def test_chex_needs_filtering_on_equinox_modules():

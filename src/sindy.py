@@ -1,37 +1,14 @@
 """SINDy-style sparse regression, with Lineax handling the linear solves.
 
-The thresholding loop runs in Python (shapes change as terms are pruned, so it
-is not jittable as written) but each inner least-squares solve goes through
-Lineax, which is the Equinox-native linear solver.
+The STLSQ loop prunes terms by masking columns rather than slicing them, which
+keeps shapes static and lets the whole solve run under `jax.jit`.
 """
 
 import itertools
-
+import jax
 import jax.numpy as jnp
 import lineax as lx
 from jaxtyping import Array, Float
-
-
-def polynomial_library(
-    X: Float[Array, "samples vars"],
-    degree: int = 2,
-    include_bias: bool = True,
-    var_names: list[str] | None = None,
-) -> tuple[Float[Array, "samples features"], list[str]]:
-    """Build the candidate feature matrix Theta(X) from monomials up to `degree`."""
-    n_samples, n_vars = X.shape
-    if var_names is None:
-        var_names = [f"x{i}" for i in range(n_vars)]
-
-    cols, names = [], []
-    if include_bias:
-        cols.append(jnp.ones((n_samples,)))
-        names.append("1")
-    for d in range(1, degree + 1):
-        for combo in itertools.combinations_with_replacement(range(n_vars), d):
-            cols.append(jnp.prod(jnp.stack([X[:, i] for i in combo]), axis=0))
-            names.append("*".join(var_names[i] for i in combo))
-    return jnp.stack(cols, axis=1), names
 
 
 def _lstsq(A: Float[Array, "m n"], b: Float[Array, " m"]) -> Float[Array, " n"]:
@@ -43,57 +20,108 @@ def _lstsq(A: Float[Array, "m n"], b: Float[Array, " m"]) -> Float[Array, " n"]:
     return solution.value
 
 
-def stlsq(
+@jax.jit(static_argnames=("n_iters",))
+def _stlsq(
     theta: Float[Array, "samples features"],
     dxdt: Float[Array, "samples targets"],
     threshold: float = 0.1,
-    n_iters: int = 10,
+    n_iters: int = 20,
 ) -> Float[Array, "features targets"]:
-    """Sequentially thresholded least squares -- the core SINDy solve.
+    """Sequentially thresholded least squares, vmapped over targets.
 
-    Fits each target column independently, repeatedly zeroing coefficients
-    below `threshold` and refitting on the surviving terms.
+    Inactive terms are zeroed by masking `theta`'s columns, not by slicing them:
+    `well_posed=False` is required so the resulting rank-deficient solve returns
+    zero for the masked columns.
     """
-    n_features = theta.shape[1]
-    n_targets = dxdt.shape[1]
-    xi = jnp.zeros((n_features, n_targets))
 
-    for j in range(n_targets):
-        coef = _lstsq(theta, dxdt[:, j])
-        active = jnp.ones(n_features, dtype=bool)
-        for _ in range(n_iters):
-            new_active = active & (jnp.abs(coef) >= threshold)
-            if bool(jnp.array_equal(new_active, active)):
-                break  # converged: nothing else was pruned
-            active = new_active
-            if not bool(active.any()):
-                coef = jnp.zeros(n_features)
-                break
-            refit = _lstsq(theta[:, active], dxdt[:, j])
-            coef = jnp.zeros(n_features).at[jnp.where(active)[0]].set(refit)
-        xi = xi.at[:, j].set(coef)
-    return xi
+    def one_target(y):
+        coef = _lstsq(theta, y)
+        mask = jnp.ones(theta.shape[1], dtype=bool)
+
+        def body(_, carry):
+            coef, mask = carry
+            mask = mask & (jnp.abs(coef) >= threshold)
+            coef = jnp.where(mask, _lstsq(theta * mask[None, :], y), 0.0)
+            return coef, mask
+
+        coef, _ = jax.lax.fori_loop(0, n_iters, body, (coef, mask))
+        return coef
+
+    return jax.vmap(one_target, in_axes=1, out_axes=1)(dxdt)
 
 
-def format_equations(
-    xi: Float[Array, "features targets"],
-    feature_names: list[str],
-    target_names: list[str] | None = None,
-    tol: float = 1e-8,
-) -> str:
-    """Render a coefficient matrix as human-readable differential equations."""
-    n_targets = xi.shape[1]
-    if target_names is None:
-        target_names = [f"x{i}" for i in range(n_targets)]
+class SINDy:
+    """Sparse identification of nonlinear dynamics over a polynomial library.
 
-    lines = []
-    for j in range(n_targets):
-        terms = []
-        for i, name in enumerate(feature_names):
-            c = float(xi[i, j])
-            if abs(c) < tol:
-                continue
-            terms.append(f"{c:+.4f} {name}" if name != "1" else f"{c:+.4f}")
-        rhs = " ".join(terms) if terms else "0"
-        lines.append(f"d{target_names[j]}/dt = {rhs}")
-    return "\n".join(lines)
+    The library is fixed at construction from `n_states` alone, independently of
+    any dataset, so the same instance can be reused across datasets of matching
+    width.
+    """
+
+    def __init__(
+        self,
+        n_states: int,
+        degree: int = 2,
+        include_bias: bool = True,
+        var_names: list[str] | None = None,
+    ):
+        self.n_states = n_states
+        self.degree = degree
+        self.include_bias = include_bias
+        self.var_names = var_names or [f"x{i}" for i in range(n_states)]
+        self.coefficients_: Float[Array, "features targets"] | None = None
+
+        # `_combos` is the library: one tuple of variable indices per monomial.
+        # Names are derived from the same pass, so they cannot drift from the
+        # columns `_build_theta` produces.
+        self._combos = [()] if include_bias else []
+        for d in range(1, degree + 1):
+            self._combos += itertools.combinations_with_replacement(
+                range(n_states), d
+            )
+        self.feature_names = [
+            "*".join(self.var_names[i] for i in c) if c else "1"
+            for c in self._combos
+        ]
+
+    def _build_theta(
+        self, X: Float[Array, "samples vars"]
+    ) -> Float[Array, "samples features"]:
+        """Evaluate the library on `X`."""
+        cols = [
+            jnp.prod(jnp.stack([X[:, i] for i in c]), axis=0)
+            if c else jnp.ones(X.shape[0])
+            for c in self._combos
+        ]
+        return jnp.stack(cols, axis=1)
+
+    def solve(
+        self,
+        X: Float[Array, "samples vars"],
+        dXdt: Float[Array, "samples targets"],
+        threshold: float = 0.1,
+        n_iters: int = 20,
+    ) -> Float[Array, "features targets"]:
+        """Fit sparse coefficients mapping the library of `X` onto `dxdt`."""
+        self.coefficients_ = _stlsq(self._build_theta(X), dXdt, threshold, n_iters)
+        return self.coefficients_
+
+    def equations(
+        self, target_names: list[str] | None = None, tol: float = 1e-8
+    ) -> str:
+        """Render the fitted coefficients as human-readable equations."""
+        xi = self.coefficients_
+        n_targets = xi.shape[1]
+        if target_names is None:
+            target_names = [f"x{i}" for i in range(n_targets)]
+
+        lines = []
+        for j in range(n_targets):
+            terms = []
+            for i, name in enumerate(self.feature_names):
+                c = float(xi[i, j])
+                if abs(c) < tol:
+                    continue
+                terms.append(f"{c:+.4f} {name}" if name != "1" else f"{c:+.4f}")
+            lines.append(f"d{target_names[j]}/dt = {' '.join(terms) or '0'}")
+        return "\n".join(lines)
