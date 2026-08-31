@@ -30,7 +30,7 @@ def polynomial_library(
     for d in range(1, degree + 1):
         for combo in itertools.combinations_with_replacement(range(n_vars), d):
             cols.append(jnp.prod(jnp.stack([X[:, i] for i in combo]), axis=0))
-            names.append(" ".join(var_names[i] for i in combo))
+            names.append("*".join(var_names[i] for i in combo))
     return jnp.stack(cols, axis=1), names
 
 
