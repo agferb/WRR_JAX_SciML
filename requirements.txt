@@ -1,0 +1,22 @@
+# Core JAX
+jax==0.10.1
+jaxlib==0.10.1
+
+# Neural networks + scientific computing (Equinox ecosystem)
+equinox==0.13.8      # neural networks as PyTrees
+diffrax==0.7.2       # ODE/SDE solvers, neural ODEs, UDEs
+optax==0.2.8         # first-order optimizers
+optimistix==0.1.0    # nonlinear least squares / root finding
+lineax==0.1.1        # linear solves (SINDy regression step)
+
+# Typing, display, testing
+jaxtyping==0.3.11    # shape/dtype annotations
+treescope==0.1.10    # interactive model display (the `nnx.display` equivalent)
+chex==0.1.91         # test assertions -- see README on eqx.partition first
+pytest==9.0.1
+
+# Numerics + plotting
+numpy==2.5.2
+scipy==1.18.1
+scikit-learn==1.9.0
+matplotlib==3.11.1

@@ -1,0 +1,110 @@
+# jax-training
+
+Differential equations, sparse regression (SINDy), autoencoders, and universal
+differential equations in JAX — built on the **Equinox** ecosystem.
+
+## Why Equinox rather than Flax
+
+An `eqx.Module` *is* a PyTree. That single property is what makes this stack
+work: a neural network can be passed straight into a Diffrax solver's inner
+loop, or sit as a field alongside mechanistic parameters in one differentiable
+object, with no `split`/`merge` bookkeeping at the boundary.
+
+```python
+class LotkaVolterraUDE(eqx.Module):
+    alpha: Float[Array, ""]   # mechanistic, known
+    delta: Float[Array, ""]   # mechanistic, known
+    net: eqx.nn.MLP           # neural closure for the unknown physics
+```
+
+`eqx.filter_grad` differentiates all of it at once; `eqx.tree_at` freezes any
+part independently. Diffrax, Optimistix, and Lineax are all Equinox-native, so
+the whole pipeline speaks one language.
+
+Flax NNX is the better choice for large-scale distributed training or when you
+need pretrained checkpoints — neither applies here.
+
+## Setup
+
+```bash
+python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
+```
+
+## Layout
+
+| Path | What's in it |
+|---|---|
+| `src/models.py` | `Autoencoder` and parameter-counting helpers |
+| `src/ude.py` | UDE vector fields, the Diffrax `solve` wrapper, multiple shooting, `freeze_mechanistic` |
+| `src/sindy.py` | Polynomial library, STLSQ sparse regression (Lineax solves), equation formatting |
+| `src/train.py` | Optax training loop with partial-freezing support |
+| `examples/lotka_volterra_ude.py` | Full pipeline: fit a UDE, then recover its closure symbolically |
+| `tests/test_smoke.py` | Smoke tests, including the chex/Equinox gotcha |
+
+## The worked example
+
+```bash
+python -m examples.lotka_volterra_ude
+```
+
+Withholds the interaction terms from Lotka-Volterra, learns them with an
+embedded MLP, then recovers them as symbols. Runs in ~18s on CPU:
+
+```
+Final multiple-shooting MSE: 1.423e-06
+Closure relative error:      0.9%, 0.8%
+
+SINDy recovery of the neural closure:
+dclosure_x/dt = -0.8948 x z
+dclosure_z/dt = +0.7964 x z
+
+Ground truth:  dclosure_x/dt = -0.9000 x z
+               dclosure_z/dt = +0.8000 x z
+```
+
+## Three things worth knowing
+
+**The closure gain is trainable, and must not start at zero.** The closure is
+`gain * net(y)`, and the fitted gain says how much correction the mechanistic
+model needed (0.1 → 0.363 in the example). At `gain=0.0` the product rule zeroes
+every gradient into `net`, so the network cannot learn until the gain moves —
+start it small but nonzero. Freezing it (`freeze_mechanistic(train_gain=False)`)
+costs ~7x in loss. Caveat: `gain * net` is over-parameterised, so read the fitted
+value as a soft diagnostic, not a measurement.
+
+**Use multiple shooting, not single shooting.** Fitting one long trajectory
+plateaus around MSE `1e0` and the closure never becomes identifiable — the
+network fits the trajectory while learning the wrong function (measured 52%
+closure error at 2e-3 trajectory MSE). Splitting into short data-initialised
+segments via `ude.multiple_shooting_windows` drops the loss to `1e-6` and the
+closure error under 1%. This is a property of the loss landscape, not of tuning.
+
+**chex needs `eqx.partition` first.** An `eqx.Module` carries non-array leaves
+(its activation function), and chex tree assertions assume array leaves:
+
+```python
+chex.assert_tree_all_finite(model)          # TypeError on the activation leaf
+
+params, _ = eqx.partition(model, eqx.is_inexact_array)
+chex.assert_tree_all_finite(params)         # fine
+```
+
+The failure is loud, not silent. `chex.assert_max_traces` composes fine with
+`eqx.filter_jit` (put `filter_jit` outermost). For shape *annotations* prefer
+`jaxtyping` over `chex.assert_shape` — it's the ecosystem convention.
+
+## Displaying models
+
+`eqx.tree_pformat(model)` for text. For the rich interactive view that
+`nnx.display` gives you, use treescope directly — it supports Equinox natively,
+and is in fact what `nnx.display` wraps:
+
+```python
+import treescope
+treescope.show(model)
+```
+
+## Notes
+
+- `module/` and `test.py` are earlier scratch files, left untouched.
+- Runs on CPU. For GPU, install a CUDA-enabled `jaxlib`.
