@@ -61,7 +61,9 @@ def main(steps: int, n_points: int, t_end: float, length: int, stride: int, seed
     print(f"Closure relative error:      {rel[0]:.1%}, {rel[1]:.1%}\n")
 
     # --- 3. recover the closure symbolically ------------------------------
-    model_sindy = sindy.SINDy(n_states=2, degree=2, var_names=["x", "z"])
+    model_sindy = sindy.SINDy(
+        n_states=2, library={"degree": 2}, var_names=["x", "z"]
+    )
     model_sindy.solve(ys, learned, threshold=0.15)
 
     print("SINDy recovery of the neural closure:")

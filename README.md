@@ -36,7 +36,7 @@ python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 |---|---|
 | `src/models.py` | `Autoencoder` and parameter-counting helpers |
 | `src/ude.py` | UDE vector fields, the Diffrax `solve` wrapper, multiple shooting, `freeze_mechanistic` |
-| `src/sindy.py` | `SINDy` class: fixed polynomial library, jittable STLSQ (Lineax solves), equation formatting |
+| `src/sindy.py` | `SINDy` class: per-equation libraries with three levels of control (total degree, per-variable degree, term exclusions), jittable STLSQ (Lineax solves), equation formatting |
 | `src/train.py` | Optax training loop with partial-freezing support |
 | `examples/lotka_volterra_ude.py` | Full pipeline: fit a UDE, then recover its closure symbolically |
 | `tests/test_smoke.py` | Smoke tests, including the chex/Equinox gotcha |

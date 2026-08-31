@@ -103,7 +103,7 @@ def test_sindy_recovers_a_known_system():
     X = jax.random.uniform(key, (200, 2), minval=0.5, maxval=2.0)
     dX = jnp.stack([-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1]], axis=1)
 
-    model = sindy.SINDy(n_states=2, degree=2, var_names=["x", "z"])
+    model = sindy.SINDy(n_states=2, library={"degree": 2}, var_names=["x", "z"])
     xi = model.solve(X, dX, threshold=0.1)
     names = model.feature_names
 
@@ -116,16 +116,105 @@ def test_sindy_recovers_a_known_system():
 def test_sindy_solve_is_jittable():
     X = jax.random.uniform(jax.random.key(1), (50, 2), minval=0.5, maxval=2.0)
     dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
-    model = sindy.SINDy(n_states=2, degree=2)
+    model = sindy.SINDy(n_states=2, library={"degree": 2})
     theta = model._build_theta(X)
-    xi = jax.jit(sindy._stlsq, static_argnames=("n_iters",))(theta, dX, 0.1, 20)
+    xi = jax.jit(sindy._stlsq, static_argnames=("n_iters",))(
+        theta, dX, model.library_mask, 0.1, 20
+    )
     chex.assert_tree_all_finite(xi)
+
+
+def test_sindy_single_spec_and_list_agree():
+    X = jax.random.uniform(jax.random.key(3), (200, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack([-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1]], axis=1)
+    shared = sindy.SINDy(n_states=2, library={"degree": 2})
+    listed = sindy.SINDy(n_states=2, library=[{"degree": 2}, {"degree": 2}])
+    assert shared.feature_names == listed.feature_names
+    chex.assert_trees_all_close(shared.solve(X, dX), listed.solve(X, dX))
+
+
+def test_sindy_per_equation_libraries():
+    """Each equation may only use terms inside its own library."""
+    X = jax.random.uniform(jax.random.key(4), (300, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack([-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1]], axis=1)
+
+    # eq0: quadratic with bias.  eq1: linear, no bias.
+    model = sindy.SINDy(
+        n_states=2,
+        library=[{"degree": 2}, {"degree": 1, "include_bias": False}],
+        var_names=["x", "z"],
+    )
+    xi = model.solve(X, dX, threshold=0.1)
+    names = model.feature_names
+
+    assert names == ["1", "x", "z", "x*x", "x*z", "z*z"]
+    assert not bool(model.library_mask[1, names.index("1")])  # eq1 has no bias
+    assert not bool(model.library_mask[1, names.index("x*z")])  # eq1 is degree 1
+
+    # eq0 still recovers its quadratic term; eq1 recovers only the linear one
+    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
+    assert xi[names.index("z"), 1] == pytest.approx(1.5, abs=1e-3)
+    # every term outside an equation's library is exactly zero
+    assert bool(jnp.all(jnp.abs(xi.T[~model.library_mask]) == 0.0))
+
+
+def test_sindy_var_degree_caps_single_variable():
+    """Level (ii): a variable's own power is capped, still under the total degree."""
+    model = sindy.SINDy(
+        n_states=2,
+        library={"degree": 3, "var_degree": (2, 1)},
+        var_names=["x", "z"],
+    )
+    allowed = [
+        name
+        for i, name in enumerate(model.feature_names)
+        if bool(model.library_mask[0, i])
+    ]
+    assert "x*x*z" in allowed  # x twice, z once, total 3
+    assert "x*x" in allowed
+    assert "z*z" not in allowed  # z twice exceeds var_degree[1]
+    assert "x*x*x" not in allowed  # x three times exceeds var_degree[0]
+
+
+def test_sindy_exclude_drops_named_terms():
+    """Level (iii): exponent vectors drop individual terms."""
+    model = sindy.SINDy(
+        n_states=2,
+        library={"degree": 2, "exclude": [(1, 1), (0, 2)]},
+        var_names=["x", "z"],
+    )
+    names = model.feature_names
+    assert not bool(model.library_mask[0, names.index("x*z")])  # (1,1)
+    assert not bool(model.library_mask[0, names.index("z*z")])  # (0,2)
+    assert bool(model.library_mask[0, names.index("x*x")])  # untouched
+
+
+def test_sindy_exclusions_vary_between_libraries():
+    model = sindy.SINDy(
+        n_states=2,
+        library=[
+            {"degree": 2, "exclude": [(1, 1)]},
+            {"degree": 2, "exclude": [(2, 0)]},
+        ],
+        var_names=["x", "z"],
+    )
+    names = model.feature_names
+    assert not bool(model.library_mask[0, names.index("x*z")])
+    assert bool(model.library_mask[1, names.index("x*z")])
+    assert bool(model.library_mask[0, names.index("x*x")])
+    assert not bool(model.library_mask[1, names.index("x*x")])
+
+
+def test_sindy_include_bias_matches_excluding_zero_vector():
+    flag = sindy.SINDy(n_states=2, library={"degree": 2, "include_bias": False})
+    excl = sindy.SINDy(n_states=2, library={"degree": 2, "exclude": [(0, 0)]})
+    chex.assert_trees_all_equal(flag.library_mask, excl.library_mask)
 
 
 def test_sindy_all_pruned_returns_finite_zeros():
     X = jax.random.uniform(jax.random.key(2), (50, 2), minval=0.5, maxval=2.0)
     dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
-    model = sindy.SINDy(n_states=2, degree=2)
+    model = sindy.SINDy(n_states=2, library={"degree": 2})
     xi = model.solve(X, dX, threshold=1e6)  # threshold prunes every term
     chex.assert_tree_all_finite(xi)
     assert bool(jnp.all(xi == 0))
