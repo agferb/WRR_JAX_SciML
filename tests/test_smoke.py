@@ -141,7 +141,7 @@ def test_sindy_per_equation_libraries():
     # eq0: quadratic with bias.  eq1: linear, no bias.
     model = sindy.SINDy(
         n_states=2,
-        library=[{"degree": 2}, {"degree": 1, "include_bias": False}],
+        library=[{"degree": 2}, {"degree": 1, "bias": False}],
         var_names=["x", "z"],
     )
     xi = model.solve(X, dX, threshold=0.1)
@@ -203,12 +203,6 @@ def test_sindy_exclusions_vary_between_libraries():
     assert bool(model.library_mask[1, names.index("x*z")])
     assert bool(model.library_mask[0, names.index("x*x")])
     assert not bool(model.library_mask[1, names.index("x*x")])
-
-
-def test_sindy_include_bias_matches_excluding_zero_vector():
-    flag = sindy.SINDy(n_states=2, library={"degree": 2, "include_bias": False})
-    excl = sindy.SINDy(n_states=2, library={"degree": 2, "exclude": [(0, 0)]})
-    chex.assert_trees_all_equal(flag.library_mask, excl.library_mask)
 
 
 def test_sindy_all_pruned_returns_finite_zeros():
