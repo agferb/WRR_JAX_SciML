@@ -117,9 +117,9 @@ def test_sindy_solve_is_jittable():
     X = jax.random.uniform(jax.random.key(1), (50, 2), minval=0.5, maxval=2.0)
     dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
     model = sindy.SINDy(n_states=2, library={"degree": 2})
-    theta = model._build_theta(X)
-    xi = jax.jit(sindy._stlsq, static_argnames=("n_iters",))(
-        theta, dX, model.library_mask, 0.1, 20
+    theta = model._build_theta(X, jnp.zeros(X.shape[0]))
+    xi = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+        theta[None], dX[None], model.library_mask[None], 0.1, 20
     )
     chex.assert_tree_all_finite(xi)
 
@@ -223,3 +223,219 @@ def test_chex_needs_filtering_on_equinox_modules():
 
     params, _ = eqx.partition(m, eqx.is_inexact_array)
     chex.assert_tree_all_finite(params)  # fine
+
+
+def test_sindy_rejects_unknown_library_keys():
+    """The guard that would have caught the `bias`/`include_bias` drift."""
+    with pytest.raises(ValueError, match="unknown library key"):
+        sindy.SINDy(n_states=2, library={"degree": 2, "interaction_degree": 1})
+
+
+def test_sindy_rejects_a_library_list_of_the_wrong_length():
+    with pytest.raises(AssertionError):
+        sindy.SINDy(n_states=3, library=[{"degree": 2}, {"degree": 1}])
+
+
+def test_stlsq_stops_once_the_active_set_settles():
+    """`max_iters` is a cap, so more iterations cannot change a settled fit."""
+    X = jax.random.uniform(jax.random.key(5), (200, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack([-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1]], axis=1)
+    model = sindy.SINDy(n_states=2, library={"degree": 3})
+    chex.assert_trees_all_equal(
+        model.solve(X, dX, max_iters=20), model.solve(X, dX, max_iters=200)
+    )
+
+
+def test_sindy_interactions_degree_matches_the_spec():
+    """The library from `prompt.md`, plus the bare derivative `bias` no longer gates."""
+    model = sindy.SINDy(
+        n_states=2,
+        library={"degree": 2, "interactions_degree": 1, "bias": False},
+        implicit=True,
+    )
+    allowed = [
+        name
+        for name, ok in zip(model.feature_names, model.library_mask[0])
+        if bool(ok)
+    ]
+    assert allowed == [
+        "x0",
+        "x1",
+        "x0*x0",
+        "x0*x1",
+        "x1*x1",
+        "dx_k",
+        "x0*dx_k",
+        "x1*dx_k",
+    ]
+
+
+def test_sindy_bias_does_not_gate_the_bare_derivative():
+    """`bias` governs the constant column only; the derivative is level (iv)."""
+    spec = {"degree": 2, "interactions_degree": 1}
+    with_bias = sindy.SINDy(n_states=2, library=spec)
+    without = sindy.SINDy(n_states=2, library={**spec, "bias": False})
+    assert bool(with_bias.library_mask[0][with_bias.feature_names.index("1")])
+    assert not bool(without.library_mask[0][without.feature_names.index("1")])
+    for model in (with_bias, without):
+        i = model.feature_names.index("dx_k")
+        assert bool(model.library_mask[0][i]), "the bare derivative must survive"
+
+
+def test_sindy_interactions_degree_zero_gives_only_the_bare_derivative():
+    model = sindy.SINDy(n_states=2, library={"degree": 2, "interactions_degree": 0})
+    derivative_terms = [n for n in model.feature_names if "dx_k" in n]
+    assert derivative_terms == ["dx_k"]
+
+
+def test_sindy_no_mixed_or_higher_order_derivative_terms():
+    model = sindy.SINDy(
+        n_states=3,
+        library={"degree": 2, "interactions_degree": 2},
+        var_names=["x", "y", "z"],
+    )
+    assert all(c.count(3) <= 1 for c in model._combos)  # index 3 is the sentinel
+    for i, own in enumerate(["dx/dt", "dy/dt", "dz/dt"]):
+        foreign = [d for d in ["dx/dt", "dy/dt", "dz/dt"] if d != own]
+        names = " ".join(model.feature_names_for(i))
+        assert all(d not in names for d in foreign)
+
+
+def test_sindy_var_interactions_degree_caps_the_interaction_family_only():
+    model = sindy.SINDy(
+        n_states=2,
+        library={
+            "degree": 2,
+            "interactions_degree": 2,
+            "var_interactions_degree": (2, 0),
+        },
+    )
+    allowed = [
+        name
+        for name, ok in zip(model.feature_names, model.library_mask[0])
+        if bool(ok)
+    ]
+    assert "x1*x1" in allowed  # untouched: that is `var_degree`'s family
+    assert "x0*x0*dx_k" in allowed
+    assert "x1*dx_k" not in allowed
+
+
+def test_sindy_short_exclude_vectors_still_work():
+    """A length-`n_states` exclusion keeps its meaning in an implicit library."""
+    short = sindy.SINDy(
+        n_states=2, library={"degree": 2, "interactions_degree": 1, "exclude": [(1, 1)]}
+    )
+    padded = sindy.SINDy(
+        n_states=2,
+        library={"degree": 2, "interactions_degree": 1, "exclude": [(1, 1, 0)]},
+    )
+    chex.assert_trees_all_equal(short.library_mask, padded.library_mask)
+    assert not bool(short.library_mask[0][short.feature_names.index("x0*x1")])
+
+
+def test_sindy_library_terms_lists_what_each_equation_holds():
+    model = sindy.SINDy(
+        n_states=2,
+        library=[{"degree": 2}, {"degree": 1}],
+        var_names=["x", "z"],
+    )
+    text = model.library_terms()
+    assert text.splitlines()[0].startswith("dx: 1, x, z, x*x")
+    assert text.splitlines()[1] == "dz: 1, x, z"
+
+
+# --- SINDy-PI (parallel implicit) ------------------------------------------
+
+JX, VMAX, KM = 0.6, 1.5, 0.3
+
+
+def _michaelis_menten(key, n=300):
+    x = jax.random.uniform(key, (n, 1), minval=0.2, maxval=3.0)
+    return x, JX - VMAX * x / (KM + x)
+
+
+def test_sindy_pi_recovers_michaelis_menten():
+    """dx/dt = jx - Vmax x/(Km + x): no explicit polynomial library can hold it."""
+    X, dX = _michaelis_menten(jax.random.key(0))
+    held_out = _michaelis_menten(jax.random.key(1), n=150)
+
+    model = sindy.SINDy(
+        n_states=1,
+        library={"degree": 3, "interactions_degree": 1},
+        var_names=["x"],
+        implicit=True,
+    )
+    model.solve(X, dX, threshold=0.05)
+    model.select(*held_out)
+    _, deriv, _ = model.scores(*held_out)
+
+    assert float(deriv[0, int(model.selected_[0])]) < 1e-3
+    # normalised against the truth 0.3 dx/dt + x dx/dt - 0.18 + 0.9 x = 0
+    text = model.equations()
+    assert "-0.1800" in text and "+0.9000" in text
+    assert "+0.3000" in text and "+1.0000" in text
+
+
+def test_sindy_pi_excludes_each_candidate_from_its_own_regression():
+    X, dX = _michaelis_menten(jax.random.key(2))
+    model = sindy.SINDy(
+        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
+    )
+    model.solve(X, dX, threshold=0.05)
+    chex.assert_trees_all_equal(
+        jnp.diagonal(model.models_[0]), jnp.zeros(len(model.feature_names))
+    )
+
+
+def test_sindy_pi_uses_each_equation_own_derivative():
+    """Only a per-equation theta can fit a rational eq0 beside a linear eq1."""
+    key = jax.random.key(3)
+    X = jax.random.uniform(key, (400, 2), minval=0.5, maxval=2.0)
+    dx0 = (1.0 - X[:, 1]) / (1.0 + X[:, 0])
+    dx1 = 0.5 * X[:, 0] - 0.7 * X[:, 1]
+    dX = jnp.stack([dx0, dx1], axis=1)
+
+    model = sindy.SINDy(
+        n_states=2, library={"degree": 1, "interactions_degree": 1}, implicit=True
+    )
+    model.solve(X, dX, threshold=0.05)
+    model.select(X, dX)
+    _, deriv, _ = model.scores(X, dX)
+    for i in range(2):
+        assert float(deriv[i, int(model.selected_[i])]) < 1e-3
+
+
+def test_sindy_pi_scores_mark_out_of_library_candidates_invalid():
+    X, dX = _michaelis_menten(jax.random.key(4))
+    model = sindy.SINDy(
+        n_states=1,
+        library={"degree": 3, "interactions_degree": 1, "bias": False},
+        implicit=True,
+    )
+    model.solve(X, dX, threshold=0.05)
+    fit, deriv, _ = model.scores(X, dX)
+    bias_column = model.feature_names.index("1")
+    assert not bool(model.library_mask[0, bias_column])
+    assert jnp.isinf(fit[0, bias_column]) and jnp.isinf(deriv[0, bias_column])
+
+
+def test_sindy_pi_solve_is_jittable():
+    X, dX = _michaelis_menten(jax.random.key(5), n=80)
+    model = sindy.SINDy(
+        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
+    )
+    thetas = model._build_thetas(X, dX)
+    models = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+        thetas, thetas, model._candidate_masks(), 0.05, 20
+    )
+    chex.assert_tree_all_finite(models)
+
+
+def test_sindy_pi_all_pruned_returns_finite_zeros():
+    X, dX = _michaelis_menten(jax.random.key(6), n=80)
+    model = sindy.SINDy(
+        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
+    )
+    models = model.solve(X, dX, threshold=1e6)
+    chex.assert_tree_all_finite(models)
+    assert bool(jnp.all(models == 0))

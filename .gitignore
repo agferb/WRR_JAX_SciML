@@ -1,7 +1,10 @@
+.gitignore
+
 __pycache__/
 *.py[cod]
 
 .claude/
+CLAUDED.MD
 
 .venv/
 *.egg-info/
