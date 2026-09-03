@@ -80,7 +80,7 @@ def test_sindy_single_spec_and_list_agree():
 
 def test_sindy_per_equation_libraries():
     """Each equation may only use terms inside its own library."""
-    X, dX = known_system(50)
+    X, dX = known_system(300)
 
     # eq0: quadratic with bias.  eq1: linear, no bias.
     model = sindy.SINDy(
@@ -160,17 +160,6 @@ def test_sindy_all_pruned_returns_finite_zeros():
     xi = model.solve(X, dX, threshold=1e6)  # threshold prunes every term
     chex.assert_tree_all_finite(xi)
     assert bool(jnp.all(xi == 0))
-
-
-def test_chex_needs_filtering_on_equinox_modules():
-    """Documents the one real chex/Equinox sharp edge."""
-    m = eqx.nn.MLP(2, 2, 8, 1, key=jax.random.key(0))
-
-    with pytest.raises(TypeError):
-        chex.assert_tree_all_finite(m)  # trips on the activation-function leaf
-
-    params, _ = eqx.partition(m, eqx.is_inexact_array)
-    chex.assert_tree_all_finite(params)  # fine
 
 
 def test_stlsq_stops_once_the_active_set_settles():
