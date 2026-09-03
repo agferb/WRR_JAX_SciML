@@ -1,6 +1,6 @@
-"""SINDy-PI on Michaelis-Menten kinetics: recovering a rational ODE.
+"""SINDy-PI on Monod-Herbert model: recovering a rational ODE.
 
-  1. Integrate dx/dt = jx - Vmax*x/(Km + x), a rational right-hand side that no
+  1. Integrate the model, a rational right-hand side that no
      explicit polynomial library can represent.
   2. Sweep every library term as the left-hand side (the parallel-implicit step).
   3. Score the candidates on a held-out trajectory and print the rational form.
@@ -15,11 +15,28 @@ import jax.numpy as jnp
 
 from src import sindy, ude
 
-TRUE = dict(jx=0.6, vmax=1.5, km=0.3)
+TRUE = dict(
+    D = 3.0,        # d-1
+    S_in = 100,     # gCOD/m3.d
+    DOsat = 10,     # mgDO/m3
+    Y = 0.67,       # gCOD_X / gCOD_S
+    mu_max = 6.0,   # d-1
+    K_S = 20,       # gCOD/m3
+    K_O = 0.2,      # gDO/m3
+    b = 0.62,       # d-1
+)
 
 
-def vector_field(t, y, args):
-    return jnp.array([TRUE["jx"] - TRUE["vmax"] * y[0] / (TRUE["km"] + y[0])])
+def vector_field(t, x, args):
+
+    kLa = jnp.clip(6 * (t - 1), 0, 7)  # gDO/m3.d
+    growth = TRUE['mu_max'] * x[0] * x[1] * x[2] / (x[0] + TRUE['Ks']) / (x[2] + TRUE['Ko'])
+
+    dx0 = -growth / TRUE['Y'] + TRUE['D'] * (TRUE['S_in'] - x[0])
+    dx1 = growth - (TRUE['D'] + TRUE['b']) * x[1]
+    dx2 = (1 - 1 / TRUE['Y']) * growth - TRUE['D'] * x[2] + kLa * (TRUE['DOsat'] - x[2])
+
+    return jnp.stack([dx0, dx1, dx2])
 
 
 def trajectory(y0: float, n_points: int, t_end: float, method: str = "exact"):

@@ -114,7 +114,11 @@ class SINDy:
     """
     Sparse identification of nonlinear dynamics over a polynomial library.
 
-    `n_states` is the number of dynamic state variables.
+    `n_states` is the number of dynamic state variables, `n_controls` the number
+    of exogenous ones: controls build the library but get no equation of their
+    own. `var_names` lists the states first, then the controls, and every
+    positional tuple below is indexed the same way over
+    `n_variables = n_states + n_controls`.
 
     `library` is one spec dict shared by every equation, or a list of `n_states`
     dicts giving each equation its own library over shared columns. A spec has
@@ -131,8 +135,8 @@ class SINDy:
 
     (i)   `degree` bounds a monomial's total degree.
     (ii)  `var_degree` bounds each variable's own power, still capped by
-          `degree`. A tuple of length `n_states`, positional: entry `i` is the
-          highest power `x_i` may take. Omit to let every variable reach
+          `degree`. A tuple of length `n_variables`, positional: entry `i` is the
+          highest power variable `i` may take. Omit to let every variable reach
           `degree`.
     (iii) `exclude` drops individual terms. Each entry is an exponent vector,
           positional: `(3, 0, 0)` is `x0**3` and `(0, 1, 2)` is `x1 * x2**2`. A
@@ -153,9 +157,12 @@ class SINDy:
 
     Set `implicit=True` to run the SINDy-PI sweep (needs `interactions_degree`).
 
-    Both `var_degree` and `var_interactions_degree` must have length `n_states`
-    -- check `library_terms()` before solving if a fit looks off. DO NOT use
-    `exclude` to drop the bias term; set `bias=False` instead.
+    Both `var_degree` and `var_interactions_degree` must have length
+    `n_variables`, not `n_states`: a short tuple is silently truncated by `zip`,
+    leaving the trailing controls uncapped with no error. `exclude` vectors are
+    padded, so those are safe at either length. Check `library_terms()` before
+    solving if a fit looks off. DO NOT use `exclude` to drop the bias term; set
+    `bias=False` instead.
     """
 
     def __init__(
@@ -175,7 +182,7 @@ class SINDy:
         self.n_variables = n_states + n_controls
 
         self.var_names = var_names or (
-            [f"x{i}" for i in range(n_states)] + [f"x{j}" for j in range(n_controls)]
+            [f"x{i}" for i in range(n_states)] + [f"u{j}" for j in range(n_controls)]
         )
         assert (
             len(self.var_names) == self.n_variables
@@ -224,7 +231,9 @@ class SINDy:
             self._name(tuple(i for i in c if i != self.n_variables), "")
             for c in self._combos
         ]
-        self._is_derivative = jnp.array([n_states in c for c in self._combos])
+        self._is_derivative = jnp.array(
+            [self.n_variables in c for c in self._combos]
+        )
         self.library_mask = jnp.array(
             [[self._allows(spec, c) for c in self._combos] for spec in self.library]
         )
@@ -395,7 +404,6 @@ class SINDy:
         self,
         X: Float[Array, "samples vars"],
         dXdt: Float[Array, "samples targets"],
-        tol: float = 1e-3,
     ) -> Int[Array, " equations"]:
         """
         Pick one left-hand-side candidate per equation into `selected_`.
@@ -404,10 +412,8 @@ class SINDy:
         within `tol` of it -- the top candidates are usually the same relation
         rescaled, so read the rational form rather than the winning term.
         """
-        _, deriv_fit, n_terms = self.scores(X, dXdt)
-        best = jnp.min(deriv_fit, axis=1, keepdims=True)
-        near = deriv_fit <= best * (1.0 + tol)
-        self.selected_ = jnp.argmin(jnp.where(near, n_terms, jnp.inf), axis=1)
+        _, deriv_fit, _ = self.scores(X, dXdt)
+        self.selected_ = jnp.min(deriv_fit, axis=1, keepdims=True)
         return self.selected_
 
     def _relation(self, equation: int, candidate: int) -> Float[Array, " features"]:
@@ -449,26 +455,51 @@ class SINDy:
         self,
         X: Float[Array, "samples vars"],
         dXdt: Float[Array, "samples targets"],
-        top: int = 3,
-    ) -> str:
-        """The `top` best candidate relations per equation, for vetting a library."""
+        top: int | None = None,
+    ) -> list[dict]:
+        """
+        Ranked candidate relations per equation, best first, for vetting a library.
+
+        One dict per equation holding parallel lists `term` (the left-hand-side
+        column), `error` (held-out derivative error) and `explicit_form` (the
+        rearranged rational form). `top` keeps only the best few; None keeps all.
+        Pass the result to `equations` to render it.
+        """
         _, deriv_fit, _ = self.scores(X, dXdt)
-        lines = []
+        ranked = []
         for i in range(self.n_states):
             deriv = f"d{self.var_names[i]}"
             names = [self._name(c, deriv) for c in self._combos]
-            for j in jnp.argsort(deriv_fit[i])[:top]:
-                j = int(j)
-                error = float(deriv_fit[i, j])
-                lines.append(
-                    f"[{error:.2e}] LHS={names[j]:<14}  {self._rational(i, j)}"
-                )
-        return "\n".join(lines)
+            order = [int(j) for j in jnp.argsort(deriv_fit[i])[:top]]
+            ranked.append(
+                {
+                    "term": [names[j] for j in order],
+                    "error": [float(deriv_fit[i, j]) for j in order],
+                    "explicit_form": [self._rational(i, j) for j in order],
+                }
+            )
+        return ranked
 
     def equations(
-        self, target_names: list[str] | None = None, tol: float = 1e-8
+        self,
+        candidates: list[dict] | None = None,
+        target_names: list[str] | None = None,
+        tol: float = 1e-8,
     ) -> str:
-        """Render the fitted result as human-readable equations."""
+        """
+        Render the fitted result as human-readable equations.
+
+        Given a `candidates` payload, lists those instead of the selected models.
+        """
+        if candidates is not None:
+            return "\n".join(
+                f"[{error:.2e}] LHS={term:<14}  {form}"
+                for equation in candidates
+                for term, error, form in zip(
+                    equation["term"], equation["error"], equation["explicit_form"]
+                )
+            )
+
         if self.implicit:
             return "\n".join(
                 self._rational(i, int(self.selected_[i]), tol)

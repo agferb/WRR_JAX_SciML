@@ -1,15 +1,7 @@
-"""Smoke tests for the models.
+"""Tests for `src.models`."""
 
-Note the `eqx.partition` in `test_chex_needs_filtering`: chex tree assertions
-assume array leaves and raise on an `eqx.Module` directly, because the module
-carries its activation function as a leaf. Filter first.
-"""
-
-import chex
-import equinox as eqx
 import jax
 import jax.numpy as jnp
-import pytest
 
 from src import models
 

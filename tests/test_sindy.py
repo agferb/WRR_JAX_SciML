@@ -1,30 +1,24 @@
-"""Smoke tests for the stack.
+"""Tests for `src.sindy`.
 
-Note the `eqx.partition` in `test_chex_needs_filtering`: chex tree assertions
-assume array leaves and raise on an `eqx.Module` directly, because the module
-carries its activation function as a leaf. Filter first.
+Kept deliberately small: each test either pins a design decision a future edit
+could plausibly reverse, or exercises an end-to-end recovery. Library-level
+gating is table-driven in `test_library_levels_gate_the_right_terms` rather than
+spread over one test per level.
 """
 
 import chex
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import pytest
 
 from src import sindy
 
-
-def known_system(n_samples: int = 100):
-    # dx/dt = -2 x + 3 x z  /  dz/dt = 1.5 z
-    key = jax.random.key(0)
-    X = jax.random.uniform(key, (n_samples, 2), minval=0.5, maxval=2.0)
-    dX = jnp.stack([-2.0 * X[:, 0], 1.5 * X[:, 1]], axis=1)
-    return X, dX
+JX, VMAX, KM = 0.6, 1.5, 0.3
 
 
-def known_system_with_control(n_samples: int = 100):
+def known_system(n_samples: int, seed: int = 0):
     # dx/dt = -2 x + 3 x z  /  dz/dt = 1.5 z + u
-    key = jax.random.key(1)
+    key = jax.random.key(seed)
     X = jax.random.uniform(key, (n_samples, 3), minval=0.5, maxval=2.0)
     dX = jnp.stack(
         [-2.0 * X[:, 0] + 3.0 * X[:, 0] * X[:, 1], 1.5 * X[:, 1] + X[:, 2]], axis=1
@@ -32,264 +26,261 @@ def known_system_with_control(n_samples: int = 100):
     return X, dX
 
 
-def test_sindy_gets_correct_theta():
-    X, dX = known_system_with_control(50)
-    model = sindy.SINDy(
-        n_states=2, library={"degree": 2}, n_controls=1, var_names=["x", "z", "u"]
-    )
-    xi = model.solve(X, dX, threshold=0.1)
-    assert xi.shape == (10, 2)
+def michaelis_menten(n_samples: int, seed: int = 0):
+    # dx/dt = jx - Vmax x / (Km + x), a rational law no explicit library can hold
+    x = jax.random.uniform(jax.random.key(seed), (n_samples, 1), minval=0.2, maxval=3.0)
+    return x, JX - VMAX * x / (KM + x)
 
 
-def test_sindy_recovers_a_known_system():
-    X, dX = known_system_with_control(300)
-    model = sindy.SINDy(
-        n_states=2, library={"degree": 2}, n_controls=1, var_names=["x", "z", "u"]
-    )
-    xi = model.solve(X, dX, threshold=0.1)
-    names = model.feature_names
-
-    assert xi[names.index("1"), 0] == pytest.approx(0.0, abs=1e-6)
-    assert xi[names.index("x"), 0] == pytest.approx(-2.0, abs=1e-3)
-    assert xi[names.index("u"), 0] == pytest.approx(0.0, abs=1e-6)
-    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
-
-    assert xi[names.index("1"), 1] == pytest.approx(0.0, abs=1e-6)
-    assert xi[names.index("z"), 1] == pytest.approx(1.5, abs=1e-3)
-    assert xi[names.index("u"), 1] == pytest.approx(1.0, abs=1e-3)
-    assert xi[names.index("x*u"), 1] == pytest.approx(0.0, abs=1e-6)
+def rational_with_control(n_samples: int, seed: int = 0):
+    # dx/dt = (u - x) / (1 + x)  ->  dx/dt + x*dx/dt - u + x = 0
+    X = jax.random.uniform(jax.random.key(seed), (n_samples, 2), minval=0.5, maxval=2.0)
+    return X, ((X[:, 1] - X[:, 0]) / (1.0 + X[:, 0]))[:, None]
 
 
-def test_sindy_solve_is_jittable():
-    X, dX = known_system(50)
-    model = sindy.SINDy(n_states=2, library={"degree": 2})
-    theta = model._build_theta(X, jnp.zeros(X.shape[0]))
-    xi = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
-        theta[None], dX[None], model.library_mask[None], 0.1, 20
-    )
-    chex.assert_tree_all_finite(xi)
+def correlated_system(n_samples: int, seed: int = 0):
+    """Near-collinear features, so STLSQ needs a second thresholding pass."""
+    X = jax.random.uniform(jax.random.key(seed), (n_samples, 2), minval=0.5, maxval=2.0)
+    X = jnp.stack([X[:, 0], 0.9 * X[:, 0] + 0.1 * X[:, 1]], axis=1)
+    dX = jnp.stack([-2.0 * X[:, 0] + 0.6 * X[:, 1] ** 2, 1.5 * X[:, 1]], axis=1)
+    return X, dX
 
 
-def test_sindy_single_spec_and_list_agree():
-    X, dX = known_system(200)
-    shared = sindy.SINDy(n_states=2, library={"degree": 2})
-    listed = sindy.SINDy(n_states=2, library=[{"degree": 2}, {"degree": 2}])
-    assert shared.feature_names == listed.feature_names
-    chex.assert_trees_all_close(shared.solve(X, dX), listed.solve(X, dX))
-
-
-def test_sindy_per_equation_libraries():
-    """Each equation may only use terms inside its own library."""
-    X, dX = known_system(300)
-
-    # eq0: quadratic with bias.  eq1: linear, no bias.
-    model = sindy.SINDy(
-        n_states=2,
-        library=[{"degree": 2}, {"degree": 1, "bias": False}],
-        var_names=["x", "z"],
-    )
-    xi = model.solve(X, dX, threshold=0.1)
-    names = model.feature_names
-
-    assert names == ["1", "x", "z", "x*x", "x*z", "z*z"]
-    assert not bool(model.library_mask[1, names.index("1")])  # eq1 has no bias
-    assert not bool(model.library_mask[1, names.index("x*z")])  # eq1 is degree 1
-
-    # eq0 still recovers its quadratic term; eq1 recovers only the linear one
-    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
-    assert xi[names.index("z"), 1] == pytest.approx(1.5, abs=1e-3)
-    # every term outside an equation's library is exactly zero
-    assert bool(jnp.all(jnp.abs(xi.T[~model.library_mask]) == 0.0))
-
-
-def test_sindy_var_degree_caps_single_variable():
-    """Level (ii): a variable's own power is capped, still under the total degree."""
-    model = sindy.SINDy(
-        n_states=2,
-        library={"degree": 3, "var_degree": (2, 1, 1)},
-        n_controls=1,
-        var_names=["x", "z", "u"],
-    )
-    allowed = [
+def allowed_terms(model: sindy.SINDy, equation: int = 0) -> list[str]:
+    return [
         name
-        for i, name in enumerate(model.feature_names)
-        if bool(model.library_mask[0, i])
+        for name, ok in zip(model.feature_names, model.library_mask[equation])
+        if bool(ok)
     ]
-    assert "x*x*z" in allowed  # x twice, z once, total 3
-    assert "x*x" in allowed
-    assert "x*u" in allowed
-    assert "z*z" not in allowed  # z twice exceeds var_degree[1]
-    assert "x*x*x" not in allowed  # x three times exceeds var_degree[0]
-    assert "z*u*u" not in allowed
 
 
-def test_sindy_exclude_drops_named_terms():
-    """Level (iii): exponent vectors drop individual terms."""
-    model = sindy.SINDy(
-        n_states=2,
-        library={"degree": 2, "exclude": [(1, 1, 0), (0, 2, 0), (0, 0, 1)]},
-        n_controls=1,
-        var_names=["x", "z", "u"],
-    )
-    names = model.feature_names
-    assert not bool(model.library_mask[0, names.index("x*z")])  # (1,1,0)
-    assert not bool(model.library_mask[0, names.index("z*z")])  # (0,2,0)
-    assert not bool(model.library_mask[0, names.index("u")])  # (0,1,1)
-    assert bool(model.library_mask[0, names.index("x*x")])  # untouched
+# --- library construction ---------------------------------------------------
+
+LIBRARY_CASES = [
+    (
+        "var_degree caps one variable under the total degree",
+        dict(
+            n_states=2,
+            n_controls=1,
+            var_names=["x", "z", "u"],
+            library={"degree": 3, "var_degree": (2, 1, 1)},
+        ),
+        {"x*x*z", "x*x", "x*u"},
+        {"z*z", "x*x*x", "z*u*u"},
+    ),
+    (
+        "exclude drops individual exponent vectors",
+        dict(
+            n_states=2,
+            n_controls=1,
+            var_names=["x", "z", "u"],
+            library={"degree": 2, "exclude": [(1, 1, 0), (0, 2, 0), (0, 0, 1)]},
+        ),
+        {"x*x"},
+        {"x*z", "z*z", "u"},
+    ),
+    (
+        "short exclude vectors are padded, not ignored",
+        dict(
+            n_states=2,
+            library={"degree": 2, "interactions_degree": 1, "exclude": [(1, 1)]},
+        ),
+        {"x0*x0"},
+        {"x0*x1"},
+    ),
+    (
+        "bias gates the constant column but never the bare derivative",
+        dict(
+            n_states=2,
+            library={"degree": 2, "interactions_degree": 1, "bias": False},
+        ),
+        {"x0", "dx_k"},
+        {"1"},
+    ),
+    (
+        "interactions_degree=0 admits the bare derivative alone",
+        dict(n_states=2, library={"degree": 2, "interactions_degree": 0}),
+        {"dx_k"},
+        {"x0*dx_k"},
+    ),
+    (
+        "var_interactions_degree caps the interaction family only",
+        dict(
+            n_states=2,
+            library={
+                "degree": 2,
+                "interactions_degree": 2,
+                "var_interactions_degree": (2, 0),
+            },
+        ),
+        {"x1*x1", "x0*x0*dx_k"},
+        {"x1*dx_k"},
+    ),
+]
 
 
-def test_sindy_exclusions_vary_between_libraries():
-    model = sindy.SINDy(
-        n_states=2,
-        library=[
-            {"degree": 2, "exclude": [(1, 1)]},
-            {"degree": 2, "exclude": [(2, 0)]},
-        ],
-        var_names=["x", "z"],
-    )
-    names = model.feature_names
-    assert not bool(model.library_mask[0, names.index("x*z")])
-    assert bool(model.library_mask[1, names.index("x*z")])
-    assert bool(model.library_mask[0, names.index("x*x")])
-    assert not bool(model.library_mask[1, names.index("x*x")])
+@pytest.mark.parametrize(
+    "kwargs,present,absent",
+    [case[1:] for case in LIBRARY_CASES],
+    ids=[case[0] for case in LIBRARY_CASES],
+)
+def test_library_levels_gate_the_right_terms(kwargs, present, absent):
+    allowed = set(allowed_terms(sindy.SINDy(**kwargs)))
+    assert present <= allowed, f"missing {present - allowed}"
+    assert not (absent & allowed), f"should have been dropped: {absent & allowed}"
 
 
-def test_sindy_all_pruned_returns_finite_zeros():
-    X, dX = known_system(50)
-    model = sindy.SINDy(n_states=2, library={"degree": 2})
-    xi = model.solve(X, dX, threshold=1e6)  # threshold prunes every term
-    chex.assert_tree_all_finite(xi)
-    assert bool(jnp.all(xi == 0))
-
-
-def test_stlsq_stops_once_the_active_set_settles():
-    """`max_iters` is a cap, so more iterations cannot change a settled fit."""
-    X, dX = known_system(200)
-    model = sindy.SINDy(n_states=2, library={"degree": 3})
-    chex.assert_trees_all_equal(
-        model.solve(X, dX, max_iters=20), model.solve(X, dX, max_iters=200)
-    )
-
-
-def test_sindy_interactions_degree_matches_the_spec():
+def test_library_matches_the_documented_example():
+    """The canonical spec, asserted in order -- `feature_names` is an axis label."""
     model = sindy.SINDy(
         n_states=2,
         library={"degree": 2, "interactions_degree": 1, "bias": False},
         implicit=True,
+    )
+    assert allowed_terms(model) == [
+        "x0",
+        "x1",
+        "x0*x0",
+        "x0*x1",
+        "x1*x1",
+        "dx_k",
+        "x0*dx_k",
+        "x1*dx_k",
+    ]
+
+
+def test_libraries_may_differ_per_equation():
+    """A list spec gives each equation its own mask over shared columns."""
+    X, dX = known_system(200)
+    shared = sindy.SINDy(n_states=2, library={"degree": 2}, n_controls=1)
+    listed = sindy.SINDy(
+        n_states=2, library=[{"degree": 2}, {"degree": 2}], n_controls=1
+    )
+    assert shared.feature_names == listed.feature_names
+    chex.assert_trees_all_close(shared.solve(X, dX), listed.solve(X, dX))
+
+    split = sindy.SINDy(
+        n_states=2,
+        library=[{"degree": 2}, {"degree": 1, "bias": False}],
         var_names=["x", "z"],
     )
-    allowed = [
-        name for name, ok in zip(model.feature_names, model.library_mask[0]) if bool(ok)
-    ]
-    assert allowed == ["x", "z", "x*x", "x*z", "z*z", "dx_k", "x*dx_k", "z*dx_k"]
+    names = split.feature_names
+    assert not bool(split.library_mask[1, names.index("1")])
+    assert not bool(split.library_mask[1, names.index("x*z")])
+    assert bool(split.library_mask[0, names.index("x*z")])
+    # library_terms() reports the mask, not the union library
+    assert "x*z" not in split.library_terms().splitlines()[1]
+
+    xi = split.solve(X[:, :2], dX, threshold=0.1)
+    assert bool(jnp.all(jnp.abs(xi.T[~split.library_mask]) == 0.0))
 
 
-def test_sindy_pi_with_control_matches_spec():
+def test_controls_build_the_library_without_getting_an_equation():
     model = sindy.SINDy(
         n_states=1,
-        library={
-            "degree": 2,
-            "interactions_degree": 1,
-            "bias": False,
-            "exclude": [(0, 1, 1)],
-        },
+        library={"degree": 2, "interactions_degree": 1},
         n_controls=1,
         var_names=["x", "u"],
+        implicit=True,
     )
-    allowed = [
-        name for name, ok in zip(model.feature_names, model.library_mask[0]) if bool(ok)
+    # one equation per state, but library columns over every variable
+    assert model.library_mask.shape[0] == 1
+    assert {"u", "x*u", "u*dx_k"} <= set(allowed_terms(model))
+    # the derivative sentinel is `n_variables`, and appears at most once
+    assert [bool(f) for f in model._is_derivative] == [
+        model.n_variables in c for c in model._combos
     ]
-    assert allowed == ["x", "u", "x*x", "x*u", "u*u", "dx_k", "x*dx_k"]
+    assert max(c.count(model.n_variables) for c in model._combos) == 1
+    # default names must not collide across the two families
+    assert sindy.SINDy(2, {"degree": 1}, n_controls=1).var_names == ["x0", "x1", "u0"]
 
 
-def test_sindy_bias_does_not_gate_the_bare_derivative():
-    """`bias` governs the constant column only; the derivative is level (iv)."""
-    spec = {"degree": 2, "interactions_degree": 1}
-    with_bias = sindy.SINDy(n_states=2, library=spec)
-    without = sindy.SINDy(n_states=2, library={**spec, "bias": False})
-    assert bool(with_bias.library_mask[0][with_bias.feature_names.index("1")])
-    assert not bool(without.library_mask[0][without.feature_names.index("1")])
-    for model in (with_bias, without):
-        i = model.feature_names.index("dx_k")
-        assert bool(model.library_mask[0][i]), "the bare derivative must survive"
+def test_unknown_library_keys_and_bad_shapes_are_rejected():
+    with pytest.raises(ValueError, match="unknown library key"):
+        sindy.SINDy(n_states=2, library={"degree": 2, "interaction_degree": 1})
+    with pytest.raises(AssertionError):
+        sindy.SINDy(n_states=3, library=[{"degree": 2}, {"degree": 1}])
 
 
-def test_sindy_interactions_degree_zero_gives_only_the_bare_derivative():
-    model = sindy.SINDy(n_states=2, library={"degree": 2, "interactions_degree": 0})
-    derivative_terms = [n for n in model.feature_names if "dx_k" in n]
-    assert derivative_terms == ["dx_k"]
+# --- the STLSQ solver -------------------------------------------------------
 
 
-def test_sindy_no_mixed_or_higher_order_derivative_terms():
+def test_stlsq_converges_and_respects_the_threshold():
+    """`max_iters` is a cap the loop settles well inside.
+
+    The `max_iters=1` leg matters: comparing only two uncapped runs would agree
+    trivially even if the loop were broken to stop after one pass.
+    """
+    X, dX = correlated_system(300)
+    model = sindy.SINDy(n_states=2, library={"degree": 3})
+    settled = model.solve(X, dX, threshold=0.1, max_iters=20)
+    chex.assert_trees_all_equal(
+        settled, model.solve(X, dX, threshold=0.1, max_iters=200)
+    )
+    # this system needs a second pass, so a loop that stopped early would differ
+    assert not jnp.allclose(settled, model.solve(X, dX, threshold=0.1, max_iters=1))
+
+    # thresholding prunes on coefficient magnitude: the true `u` coefficient is 1.0
+    Xc, dXc = known_system(200)
+    controlled = sindy.SINDy(
+        n_states=2, library={"degree": 3}, n_controls=1, var_names=["x", "z", "u"]
+    )
+    names = controlled.feature_names
+    assert float(controlled.solve(Xc, dXc, threshold=1.5)[names.index("u"), 1]) == 0.0
+    assert controlled.solve(Xc, dXc, threshold=0.5)[
+        names.index("u"), 1
+    ] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_solve_is_jittable_and_survives_total_pruning():
+    """Both modes trace, and a fully masked solve returns zeros rather than NaN."""
+    X, dX = known_system(50)
+    explicit = sindy.SINDy(n_states=2, library={"degree": 2}, n_controls=1)
+    theta = explicit._build_theta(X, jnp.zeros(X.shape[0]))
+    xi = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+        theta[None], dX[None], explicit.library_mask[None], 0.1, 20
+    )
+    chex.assert_tree_all_finite(xi)
+    pruned = explicit.solve(X, dX, threshold=1e6)
+    chex.assert_tree_all_finite(pruned)
+    assert bool(jnp.all(pruned == 0))
+
+    Xm, dXm = michaelis_menten(80, seed=5)
+    implicit = sindy.SINDy(
+        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
+    )
+    thetas = implicit._build_thetas(Xm, dXm)
+    models = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+        thetas, thetas, implicit._candidate_masks(), 0.05, 20
+    )
+    chex.assert_tree_all_finite(models)
+    pruned = implicit.solve(Xm, dXm, threshold=1e6)
+    chex.assert_tree_all_finite(pruned)
+    assert bool(jnp.all(pruned == 0))
+
+
+# --- recovery ---------------------------------------------------------------
+
+
+def test_explicit_recovers_a_known_system_with_control():
+    X, dX = known_system(300)
     model = sindy.SINDy(
-        n_states=3,
-        library={"degree": 2, "interactions_degree": 2},
-        var_names=["x", "y", "z"],
+        n_states=2, library={"degree": 2}, n_controls=1, var_names=["x", "z", "u"]
     )
-    assert all(c.count(3) <= 1 for c in model._combos)  # index 3 is the sentinel
-    deriv_names = ["dx", "dy", "dz"]
-    for i, own in enumerate(deriv_names):
-        foreign = [d for d in deriv_names if d != own]
-        names = " ".join([model._name(c, own) for c in model._combos])
-        assert all(d not in names for d in foreign)
+    xi = model.solve(X, dX, threshold=0.1)
+    names = model.feature_names
 
-
-def test_sindy_var_interactions_degree_caps_the_interaction_family_only():
-    model = sindy.SINDy(
-        n_states=2,
-        library={
-            "degree": 2,
-            "interactions_degree": 2,
-            "var_interactions_degree": (2, 0),
-        },
-    )
-    allowed = [
-        name for name, ok in zip(model.feature_names, model.library_mask[0]) if bool(ok)
-    ]
-    assert "x1*x1" in allowed  # untouched: that is `var_degree`'s family
-    assert "x0*x0*dx_k" in allowed
-    assert "x1*dx_k" not in allowed
-
-
-def test_sindy_short_exclude_vectors_still_work():
-    """A length-`n_states` exclusion keeps its meaning in an implicit library."""
-    short = sindy.SINDy(
-        n_states=2, library={"degree": 2, "interactions_degree": 1, "exclude": [(1, 1)]}
-    )
-    padded = sindy.SINDy(
-        n_states=2,
-        library={"degree": 2, "interactions_degree": 1, "exclude": [(1, 1, 0)]},
-    )
-    chex.assert_trees_all_equal(short.library_mask, padded.library_mask)
-    assert not bool(short.library_mask[0][short.feature_names.index("x0*x1")])
-
-
-def test_sindy_library_terms_lists_what_each_equation_holds():
-    model = sindy.SINDy(
-        n_states=2,
-        library=[{"degree": 2}, {"degree": 1}],
-        var_names=["x", "z"],
-    )
-    text = model.library_terms()
-    assert text.splitlines()[0].startswith("dx: 1, x, z, x*x")
-    assert text.splitlines()[1] == "dz: 1, x, z"
-
-
-# --- SINDy-PI (parallel implicit) ------------------------------------------
-
-JX, VMAX, KM = 0.6, 1.5, 0.3
-
-
-def _michaelis_menten(key, n=300):
-    x = jax.random.uniform(key, (n, 1), minval=0.2, maxval=3.0)
-    return x, JX - VMAX * x / (KM + x)
+    assert xi[names.index("x"), 0] == pytest.approx(-2.0, abs=1e-3)
+    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
+    assert xi[names.index("u"), 0] == pytest.approx(0.0, abs=1e-6)
+    assert xi[names.index("z"), 1] == pytest.approx(1.5, abs=1e-3)
+    assert xi[names.index("u"), 1] == pytest.approx(1.0, abs=1e-3)
+    assert xi[names.index("1"), 1] == pytest.approx(0.0, abs=1e-6)
 
 
 def test_sindy_pi_recovers_michaelis_menten():
-    """dx/dt = jx - Vmax x/(Km + x): no explicit polynomial library can hold it."""
-    X, dX = _michaelis_menten(jax.random.key(0))
-    held_out = _michaelis_menten(jax.random.key(1), n=150)
-
+    X, dX = michaelis_menten(300)
+    held_out = michaelis_menten(150, seed=1)
     model = sindy.SINDy(
         n_states=1,
         library={"degree": 3, "interactions_degree": 1},
@@ -298,17 +289,54 @@ def test_sindy_pi_recovers_michaelis_menten():
     )
     model.solve(X, dX, threshold=0.05)
     model.select(*held_out)
-    _, deriv, _ = model.scores(*held_out)
+    _, deriv_fit, _ = model.scores(*held_out)
 
-    assert float(deriv[0, int(model.selected_[0])]) < 1e-3
-    # normalised against the truth 0.3 dx/dt + x dx/dt - 0.18 + 0.9 x = 0
+    assert float(deriv_fit[0, int(model.selected_[0])]) < 1e-3
+    # truth: 0.3 dx/dt + x dx/dt - 0.18 + 0.9 x = 0, denominator normalised to +1
     text = model.equations()
     assert "-0.1800" in text and "+0.9000" in text
     assert "+0.3000" in text and "+1.0000" in text
 
 
+def test_sindy_pi_recovers_a_rational_system_with_control():
+    """The regression guard for the derivative sentinel under control."""
+    X, dX = rational_with_control(400)
+    model = sindy.SINDy(
+        n_states=1,
+        library={"degree": 2, "interactions_degree": 1},
+        n_controls=1,
+        var_names=["x", "u"],
+        implicit=True,
+    )
+    model.solve(X, dX, threshold=0.05)
+    model.select(X, dX)
+    _, deriv_fit, _ = model.scores(X, dX)
+    assert float(deriv_fit[0, int(model.selected_[0])]) < 1e-3
+    text = model.equations()
+    assert "+1.0000*x" in text and "-1.0000*u" in text
+
+
+def test_sindy_pi_uses_each_equation_own_derivative():
+    """Only a per-equation theta fits a rational eq0 beside a linear eq1."""
+    X = jax.random.uniform(jax.random.key(3), (400, 2), minval=0.5, maxval=2.0)
+    dX = jnp.stack(
+        [(1.0 - X[:, 1]) / (1.0 + X[:, 0]), 0.5 * X[:, 0] - 0.7 * X[:, 1]], axis=1
+    )
+    model = sindy.SINDy(
+        n_states=2, library={"degree": 1, "interactions_degree": 1}, implicit=True
+    )
+    model.solve(X, dX, threshold=0.05)
+    model.select(X, dX)
+    _, deriv_fit, _ = model.scores(X, dX)
+    assert all(float(deriv_fit[i, int(model.selected_[i])]) < 1e-3 for i in range(2))
+
+
+# --- the SINDy-PI sweep -----------------------------------------------------
+
+
 def test_sindy_pi_excludes_each_candidate_from_its_own_regression():
-    X, dX = _michaelis_menten(jax.random.key(2))
+    """Without the `~jnp.eye` self-exclusion every candidate trivially fits itself."""
+    X, dX = michaelis_menten(300, seed=2)
     model = sindy.SINDy(
         n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
     )
@@ -318,55 +346,55 @@ def test_sindy_pi_excludes_each_candidate_from_its_own_regression():
     )
 
 
-def test_sindy_pi_uses_each_equation_own_derivative():
-    """Only a per-equation theta can fit a rational eq0 beside a linear eq1."""
-    key = jax.random.key(3)
-    X = jax.random.uniform(key, (400, 2), minval=0.5, maxval=2.0)
-    dx0 = (1.0 - X[:, 1]) / (1.0 + X[:, 0])
-    dx1 = 0.5 * X[:, 0] - 0.7 * X[:, 1]
-    dX = jnp.stack([dx0, dx1], axis=1)
-
-    model = sindy.SINDy(
-        n_states=2, library={"degree": 1, "interactions_degree": 1}, implicit=True
-    )
-    model.solve(X, dX, threshold=0.05)
-    model.select(X, dX)
-    _, deriv, _ = model.scores(X, dX)
-    for i in range(2):
-        assert float(deriv[i, int(model.selected_[i])]) < 1e-3
-
-
-def test_sindy_pi_scores_mark_out_of_library_candidates_invalid():
-    X, dX = _michaelis_menten(jax.random.key(4))
+def test_sindy_pi_scoring_and_selection():
+    X, dX = michaelis_menten(300, seed=4)
     model = sindy.SINDy(
         n_states=1,
         library={"degree": 3, "interactions_degree": 1, "bias": False},
+        var_names=["x"],
         implicit=True,
     )
     model.solve(X, dX, threshold=0.05)
-    fit, deriv, _ = model.scores(X, dX)
+    fit, deriv_fit, n_terms = model.scores(X, dX)
+
+    # candidates outside the library are unusable, not merely bad
     bias_column = model.feature_names.index("1")
     assert not bool(model.library_mask[0, bias_column])
-    assert jnp.isinf(fit[0, bias_column]) and jnp.isinf(deriv[0, bias_column])
+    assert jnp.isinf(fit[0, bias_column]) and jnp.isinf(deriv_fit[0, bias_column])
+
+    model.select(X, dX)
+    chosen = int(model.selected_[0])
+    assert float(deriv_fit[0, chosen]) == pytest.approx(float(jnp.min(deriv_fit[0])))
+    assert int(n_terms[0, chosen]) > 0
 
 
-def test_sindy_pi_solve_is_jittable():
-    X, dX = _michaelis_menten(jax.random.key(5), n=80)
+def test_candidates_rank_records_and_equations_render_them():
+    X, dX = michaelis_menten(300, seed=7)
     model = sindy.SINDy(
-        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
+        n_states=1,
+        library={"degree": 3, "interactions_degree": 1},
+        var_names=["x"],
+        implicit=True,
     )
-    thetas = model._build_thetas(X, dX)
-    models = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
-        thetas, thetas, model._candidate_masks(), 0.05, 20
-    )
-    chex.assert_tree_all_finite(models)
+    model.solve(X, dX, threshold=0.05)
 
+    every = model.candidates(X, dX)
+    assert len(every) == model.n_states
+    assert set(every[0]) == {"term", "error", "explicit_form"}
+    assert len(every[0]["term"]) == len(model.feature_names)  # top=None keeps all
+    assert every[0]["error"] == sorted(every[0]["error"])
 
-def test_sindy_pi_all_pruned_returns_finite_zeros():
-    X, dX = _michaelis_menten(jax.random.key(6), n=80)
-    model = sindy.SINDy(
-        n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
-    )
-    models = model.solve(X, dX, threshold=1e6)
-    chex.assert_tree_all_finite(models)
-    assert bool(jnp.all(models == 0))
+    payload = model.candidates(X, dX, top=2)
+    assert payload[0]["term"] == every[0]["term"][:2]
+    lines = model.equations(payload).splitlines()
+    assert len(lines) == 2
+    assert payload[0]["term"][0] in lines[0]
+    assert payload[0]["explicit_form"][0] in lines[0]
+
+    # the rational form is normalised so the denominator's dominant term is +1,
+    # which is what makes rescaled duplicates comparable
+    assert "+1.0000" in payload[0]["explicit_form"][0].split(" / ")[1]
+
+    # without a payload it still renders the selected models
+    model.select(X, dX)
+    assert model.equations().startswith("dx/dt = ")

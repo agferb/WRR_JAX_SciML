@@ -1,15 +1,14 @@
-"""Smoke tests for the ude.
+"""Tests for `src.ude`.
 
-Note the `eqx.partition` in `test_chex_needs_filtering`: chex tree assertions
-assume array leaves and raise on an `eqx.Module` directly, because the module
-carries its activation function as a leaf. Filter first.
+`chex` tree assertions need `eqx.partition` first -- an `eqx.Module` carries its
+activation function as a non-array leaf. That is a property of the libraries,
+not of this repo, and is documented in the README rather than asserted here.
 """
 
 import chex
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import pytest
 
 from src import ude
 
@@ -49,17 +48,16 @@ def test_zero_gain_starves_the_network():
     assert jnp.abs(grads.gain) > 0  # only the gain itself can move
 
 
-def test_closure_includes_the_gain():
+def test_closure_is_the_gain_times_the_net():
+    """Read the closure through `closure()` -- `net(y)` alone omits the gain."""
     model = ude.LotkaVolterraUDE(1.3, 1.8, key=jax.random.key(0), gain=0.1)
     y = jnp.array([1.0, 2.0])
     chex.assert_trees_all_close(model.closure(y), model.gain * model.net(y))
     # bound methods of an eqx.Module are PyTrees, so this vmaps
     chex.assert_shape(jax.vmap(model.closure)(jnp.ones((4, 2))), (4, 2))
 
-
-def test_gain_scales_the_closure():
-    ts = jnp.linspace(0.0, 1.0, 5)
-    y0 = jnp.array([1.0, 1.0])
+    # and the gain reaches the solution, not just the closure
+    ts, y0 = jnp.linspace(0.0, 1.0, 5), jnp.array([1.0, 1.0])
     off = ude.LotkaVolterraUDE(1.3, 1.8, key=jax.random.key(0), gain=0.0)
     on = ude.LotkaVolterraUDE(1.3, 1.8, key=jax.random.key(0), gain=1.0)
     assert not jnp.allclose(ude.solve(off, y0, ts), ude.solve(on, y0, ts))
@@ -88,13 +86,3 @@ def test_multiple_shooting_windows():
     # windows are contiguous slices of the original trajectory
     chex.assert_trees_all_close(yw[0], ys[0:4])
 
-
-def test_chex_needs_filtering_on_equinox_modules():
-    """Documents the one real chex/Equinox sharp edge."""
-    m = eqx.nn.MLP(2, 2, 8, 1, key=jax.random.key(0))
-
-    with pytest.raises(TypeError):
-        chex.assert_tree_all_finite(m)  # trips on the activation-function leaf
-
-    params, _ = eqx.partition(m, eqx.is_inexact_array)
-    chex.assert_tree_all_finite(params)  # fine
