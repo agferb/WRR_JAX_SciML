@@ -90,8 +90,8 @@ def _stlsq(
     )
 
 
-def _normalise_spec(spec: dict, n_states: int) -> dict:
-    """Fill a library spec's optional keys and pad `exclude` to `n_states + 1`."""
+def _normalise_spec(spec: dict, n_vars: int) -> dict:
+    """Fill a library spec's optional keys and pad `exclude` to `n_vars + 1`."""
     unknown = set(spec) - _SPEC_KEYS
     if unknown:
         raise ValueError(
@@ -99,7 +99,7 @@ def _normalise_spec(spec: dict, n_states: int) -> dict:
             f"expected any of {sorted(_SPEC_KEYS)}"
         )
     exclude = spec.get("exclude") or ()
-    padded = {tuple(e) + (0,) * (n_states + 1 - len(e)) for e in exclude}
+    padded = {tuple(e) + (0,) * (n_vars + 1 - len(e)) for e in exclude}
     return {
         "degree": spec["degree"],
         "var_degree": spec.get("var_degree"),
@@ -162,21 +162,32 @@ class SINDy:
         self,
         n_states: int,
         library: dict | Sequence[dict],
+        n_controls: int = 0,
         var_names: list[str] | None = None,
         implicit: bool = False,
     ):
         assert (
             isinstance(library, dict) or len(library) == n_states
         ), "`library` must be one spec dict or a sequence of `n_states` dicts."
+
         self.n_states = n_states
-        self.var_names = var_names or [f"x{i}" for i in range(n_states)]
+        self.n_controls = n_controls
+        self.n_variables = n_states + n_controls
+
+        self.var_names = var_names or (
+            [f"x{i}" for i in range(n_states)] + [f"x{j}" for j in range(n_controls)]
+        )
+        assert (
+            len(self.var_names) == self.n_variables
+        ), "`var_names` must have length n_states + n_controls"
+
         self.implicit = implicit
         self.coefficients_: Float[Array, "features targets"] | None = None
         self.models_: Float[Array, "equations features candidates"] | None = None
         self.selected_: Int[Array, " equations"] | None = None
 
         specs = [library] * n_states if isinstance(library, dict) else library
-        self.library = [_normalise_spec(spec, n_states) for spec in specs]
+        self.library = [_normalise_spec(spec, self.n_variables) for spec in specs]
 
         max_degree = max(spec["degree"] for spec in self.library)
         caps = [spec["interactions_degree"] for spec in self.library]
@@ -186,18 +197,23 @@ class SINDy:
         # carrying the sentinel derivative index.
         combos = [()]
         for d in range(1, max_degree + 1):
-            combos += itertools.combinations_with_replacement(range(n_states), d)
+            combos += itertools.combinations_with_replacement(
+                range(self.n_variables), d
+            )
         if max_interactions is not None:
             for d in range(max_interactions + 1):
-                pure = itertools.combinations_with_replacement(range(n_states), d)
-                combos += [c + (n_states,) for c in pure]
+                pure = itertools.combinations_with_replacement(
+                    range(self.n_variables), d
+                )
+                combos += [c + (self.n_variables,) for c in pure]
 
         # A derivative column no equation admits would still cost a whole
         # candidate regression in implicit mode, so drop it rather than mask it.
         self._combos = [
             c
             for c in combos
-            if n_states not in c or any(self._allows(s, c) for s in self.library)
+            if self.n_variables not in c
+            or any(self._allows(s, c) for s in self.library)
         ]
 
         # One label per union-library column, admitted or not: these line up with
@@ -205,7 +221,8 @@ class SINDy:
         # column (holding zero) and its name. `library_terms()` is the other view.
         self.feature_names = [self._name(c, "dx_k") for c in self._combos]
         self._mono_names = [
-            self._name(tuple(i for i in c if i != n_states), "") for c in self._combos
+            self._name(tuple(i for i in c if i != self.n_variables), "")
+            for c in self._combos
         ]
         self._is_derivative = jnp.array([n_states in c for c in self._combos])
         self.library_mask = jnp.array(
@@ -214,14 +231,14 @@ class SINDy:
 
     def _name(self, combo: tuple[int, ...], deriv: str) -> str:
         """Render one monomial, writing the sentinel index as `deriv`."""
-        parts = [deriv if i == self.n_states else self.var_names[i] for i in combo]
+        parts = [deriv if i == self.n_variables else self.var_names[i] for i in combo]
         return "*".join(parts) if parts else "1"
 
     def _allows(self, spec: dict, combo: tuple[int, ...]) -> bool:
         """Whether one equation's library admits `combo`, across all levels."""
         # Exponent vector: entry i is the power of variable i, the last entry the
         # power of the equation's own derivative.
-        exponents = tuple(combo.count(i) for i in range(self.n_states + 1))
+        exponents = tuple(combo.count(i) for i in range(self.n_variables + 1))
         deriv, monomial = exponents[-1], exponents[:-1]
         total = sum(monomial)
 
@@ -246,23 +263,14 @@ class SINDy:
             return True
         return all(e <= cap for e, cap in zip(monomial, var_cap))
 
-    def feature_names_for(self, equation: int) -> list[str]:
-        """`feature_names` with the derivative token bound to one equation.
-
-        Labels every column, including ones this equation's library excludes --
-        they exist in `models_` and hold zeros. For the admitted terms alone, use
-        `library_terms()`.
-        """
-        deriv = f"d{self.var_names[equation]}"
-        return [self._name(c, deriv) for c in self._combos]
-
     def library_terms(self) -> str:
         """The terms each equation's library holds -- check this before solving."""
         lines = []
         for i in range(self.n_states):
-            names = self.feature_names_for(i)
+            deriv = f"d{self.var_names[i]}"
+            names = [self._name(c, deriv) for c in self._combos]
             allowed = [n for n, ok in zip(names, self.library_mask[i]) if ok]
-            lines.append(f"d{self.var_names[i]}: {', '.join(allowed)}")
+            lines.append(f"{deriv}: {', '.join(allowed)}")
         return "\n".join(lines)
 
     def _build_theta(
@@ -308,6 +316,7 @@ class SINDy:
         `models_`, `(equations, features, candidates)`, where `models_[i, :, j]`
         is equation `i`'s model with library column `j` on the left-hand side.
         """
+        assert X.shape[1] == self.n_variables
         assert dXdt.shape[1] == self.n_states
 
         if not self.implicit:
@@ -446,7 +455,8 @@ class SINDy:
         _, deriv_fit, _ = self.scores(X, dXdt)
         lines = []
         for i in range(self.n_states):
-            names = self.feature_names_for(i)
+            deriv = f"d{self.var_names[i]}"
+            names = [self._name(c, deriv) for c in self._combos]
             for j in jnp.argsort(deriv_fit[i])[:top]:
                 j = int(j)
                 error = float(deriv_fit[i, j])

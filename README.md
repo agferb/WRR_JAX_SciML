@@ -158,5 +158,4 @@ treescope.show(model)
 
 ## Notes
 
-- `module/` and `test.py` are earlier scratch files, left untouched.
 - Runs on CPU. For GPU, install a CUDA-enabled `jaxlib`.
