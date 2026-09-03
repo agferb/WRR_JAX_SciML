@@ -451,7 +451,7 @@ class SINDy:
                 j = int(j)
                 error = float(deriv_fit[i, j])
                 lines.append(
-                    f"[{error:.2e}] LHS={names[j]:>14}  {self._rational(i, j)}"
+                    f"[{error:.2e}] LHS={names[j]:<14}  {self._rational(i, j)}"
                 )
         return "\n".join(lines)
 
