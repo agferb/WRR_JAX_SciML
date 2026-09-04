@@ -9,69 +9,96 @@ Run:  python -m examples.michaelis_menten_sindy_pi
 """
 
 import argparse
+from ast import Tuple
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
+from jaxtyping import Array, Float
 
 from src import sindy, ude
 
 TRUE = dict(
-    D = 3.0,        # d-1
-    S_in = 100,     # gCOD/m3.d
-    DOsat = 10,     # mgDO/m3
-    Y = 0.67,       # gCOD_X / gCOD_S
-    mu_max = 6.0,   # d-1
-    K_S = 20,       # gCOD/m3
-    K_O = 0.2,      # gDO/m3
-    b = 0.62,       # d-1
+    D=3.0,  # d-1
+    S_in=100,  # gCOD/m3.d
+    DOsat=10,  # mgDO/m3
+    Y=0.67,  # gCOD_X / gCOD_S
+    mu_max=6.0,  # d-1
+    K_S=20,  # gCOD/m3
+    K_O=0.2,  # gDO/m3
+    b=0.62,  # d-1
 )
 
 
 def vector_field(t, x, args):
 
-    kLa = jnp.clip(6 * (t - 1), 0, 7)  # gDO/m3.d
-    growth = TRUE['mu_max'] * x[0] * x[1] * x[2] / (x[0] + TRUE['Ks']) / (x[2] + TRUE['Ko'])
+    kLa = args(t)  # gDO/m3.d
+    growth = (
+        TRUE["mu_max"]
+        * x[0]
+        * x[1]
+        * x[2]
+        / (x[0] + TRUE["K_S"])
+        / (x[2] + TRUE["K_O"])
+    )
 
-    dx0 = -growth / TRUE['Y'] + TRUE['D'] * (TRUE['S_in'] - x[0])
-    dx1 = growth - (TRUE['D'] + TRUE['b']) * x[1]
-    dx2 = (1 - 1 / TRUE['Y']) * growth - TRUE['D'] * x[2] + kLa * (TRUE['DOsat'] - x[2])
+    dx0 = -growth / TRUE["Y"] + TRUE["D"] * (TRUE["S_in"] - x[0])
+    dx1 = growth - (TRUE["D"] + TRUE["b"]) * x[1]
+    dx2 = (1 - 1 / TRUE["Y"]) * growth - TRUE["D"] * x[2] + kLa * (TRUE["DOsat"] - x[2])
 
     return jnp.stack([dx0, dx1, dx2])
 
 
-def trajectory(y0: float, n_points: int, t_end: float, method: str = "exact"):
-    """A trajectory and its derivatives, either exact or by finite differences."""
-    ts = jnp.linspace(0.0, t_end, n_points)
-    ys = ude.solve(vector_field, jnp.array([y0]), ts)
-    if method == "exact":
-        return ys, jax.vmap(lambda y: vector_field(0.0, y, None))(ys)
-    if method == "finite-diff":
-        return ys, jnp.gradient(ys[:, 0], ts)[:, None]
-    else:
-        raise ValueError("`method` must be either 'exact' or 'finite-diff")
+def trajectory(
+    x0: Float[Array, " states"],
+    t_span: Tuple[float],
+    dt: float,
+    control: Callable = None,
+) -> tuple[Float[Array, "samples vars"], Float[Array, "samples states"]]:
+    """A trajectory and its derivatives (from vector field)."""
+
+    ts = jnp.arange(t_span[0], t_span[1] + dt, dt)
+    xs = ude.solve(vector_field, x0, ts, args=control)
+    us = jax.vmap(control)(ts)[:, None]
+    dxs = jax.vmap(vector_field, in_axes=(0, 0, None))(ts, xs, control)
+
+    return jnp.concatenate([xs, us], axis=1), dxs
 
 
-def main(n_points: int, t_end: float, y0: float, threshold: float):
-    ys, dys = trajectory(y0, n_points, t_end, method="exact")
-    held_out = trajectory(0.85 * y0, 173, t_end, method="exact")
+def main():
+
+    dt = 0.01  # d
+    t_span = (0.0, 10.0)  # d
+    x0_train = jnp.array([0, 15, 0])  # [gCOD/m3]
+    x0_test = jnp.array([25, 40, 0])  # [gCOD/m3]
+    noise = 0.05
+    threshold = 0.05
+
+    kLa = lambda t: jnp.clip(6 * (t - 1), 0, 7)
+    ys_train, dxs_train = trajectory(x0_train, t_span, dt, kLa)
+    ys_test, dxs_test = trajectory(x0_test, t_span, dt, kLa)
 
     lib = {
         "degree": 3,
-        "interactions_degree": 1,
+        "interactions_degree": 2,
+        "var_degree": (3, 3, 3, 1),
+        "exclude": [()],
     }
-    model = sindy.SINDy(n_states=1, library=lib, var_names=["x"], implicit=True)
-    model.solve(ys, dys, threshold=threshold)
+    model = sindy.SINDy()
+    model.solve(ys_train, dxs_train, threshold=threshold)
 
     print(f"Library swept ({len(model.feature_names)} candidates per equation):")
     print(f"  {model.library_terms()}")
 
     print("\nBest candidates on held-out data:")
-    print(model.equations(model.candidates(*held_out, top=4)))
+    print(model.equations(model.candidates(ys_test, dxs_test, top=4)))
 
-    selected = int(model.select(*held_out)[0])
-    _, deriv_fit, _ = model.scores(*held_out)
+    selected = int(model.select(ys_test, dxs_test)[0])
+    _, deriv_fit, _ = model.scores(ys_test, dxs_test)
     print("\nSelected equation:")
     print(model.equations())
+
+    # REMAKE FOR NEW SYSTEM
     km, jx, vmax = TRUE["km"], TRUE["jx"], TRUE["vmax"]
     print(
         f"Ground truth:      dx/dt = -({-jx * km:+.4f} {vmax - jx:+.4f} x)"
@@ -79,28 +106,12 @@ def main(n_points: int, t_end: float, y0: float, threshold: float):
     )
     print(f"Held-out derivative error: {float(deriv_fit[0, selected]):.2e}")
 
-    # Padding the library costs uniqueness -- see the README.
-    lib_loose = {
-        "degree": 4,
-        "interactions_degree": 2,
-    }
-    loose = sindy.SINDy(n_states=1, library=lib_loose, var_names=["x"], implicit=True)
-    loose.solve(ys, dys, threshold=threshold)
-    loose_selected = int(loose.select(*held_out)[0])
-    _, loose_deriv_fit, _ = loose.scores(*held_out)
-    print("\nSame data, library padded by one degree (degree=4, interactions=2):")
-    print(f"  {loose.equations()}")
-    print(
-        f"  error {float(loose_deriv_fit[0, loose_selected]):.2e} -- small, but"
-        " the form carries spurious quadratic terms."
-    )
-
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--n-points", type=int, default=200)
-    p.add_argument("--t-end", type=float, default=12.0)
-    p.add_argument("--y0", type=float, default=3.0)
+    p.add_argument("--dt", type=float, default=0.01)
+    p.add_argument("--t-end", type=float, default=10.0)
+    p.add_argument("--x0", type=float, default=3.0)
     p.add_argument("--threshold", type=float, default=0.05)
     a = p.parse_args()
     main(a.n_points, a.t_end, a.y0, a.threshold)

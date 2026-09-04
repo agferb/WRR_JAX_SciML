@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from src import sindy
+from src import sindy, sindy_utils
 
 JX, VMAX, KM = 0.6, 1.5, 0.3
 
@@ -102,6 +102,21 @@ LIBRARY_CASES = [
         dict(n_states=2, library={"degree": 2, "interactions_degree": 0}),
         {"dx_k"},
         {"x0*dx_k"},
+    ),
+    (
+        "a True slot in exclude drops every power of that variable",
+        dict(n_states=2, library={"degree": 3, "exclude": [(2, True, 0)]}),
+        {"x0*x0", "x0*x1*x1"},
+        {"x0*x0*x1"},
+    ),
+    (
+        "var_degree caps how far a True slot unfolds",
+        dict(
+            n_states=2,
+            library={"degree": 3, "var_degree": (3, 1), "exclude": [(1, True, 0)]},
+        ),
+        {"x0", "x0*x0", "x0*x0*x0"},
+        {"x0*x1"},
     ),
     (
         "var_interactions_degree caps the interaction family only",
@@ -237,7 +252,7 @@ def test_solve_is_jittable_and_survives_total_pruning():
     X, dX = known_system(50)
     explicit = sindy.SINDy(n_states=2, library={"degree": 2}, n_controls=1)
     theta = explicit._build_theta(X, jnp.zeros(X.shape[0]))
-    xi = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+    xi = jax.jit(sindy_utils._stlsq, static_argnames=("max_iters",))(
         theta[None], dX[None], explicit.library_mask[None], 0.1, 20
     )
     chex.assert_tree_all_finite(xi)
@@ -250,7 +265,7 @@ def test_solve_is_jittable_and_survives_total_pruning():
         n_states=1, library={"degree": 2, "interactions_degree": 1}, implicit=True
     )
     thetas = implicit._build_thetas(Xm, dXm)
-    models = jax.jit(sindy._stlsq, static_argnames=("max_iters",))(
+    models = jax.jit(sindy_utils._stlsq, static_argnames=("max_iters",))(
         thetas, thetas, implicit._candidate_masks(), 0.05, 20
     )
     chex.assert_tree_all_finite(models)
@@ -398,3 +413,34 @@ def test_candidates_rank_records_and_equations_render_them():
     # without a payload it still renders the selected models
     model.select(X, dX)
     assert model.equations().startswith("dx/dt = ")
+
+
+def test_exclude_wildcard_unfolds_over_every_power():
+    """`True` means "present at any power", so power 0 is left alone."""
+    spec = sindy_utils._normalise_spec({"degree": 3, "exclude": [(2, True, 0)]}, 2)
+    assert sorted(spec["exclude"]) == [(2, 1, 0), (2, 2, 0), (2, 3, 0)]
+
+    # a tighter per-variable cap shortens the unfolding
+    capped = sindy_utils._normalise_spec(
+        {"degree": 3, "var_degree": (3, 2), "exclude": [(2, True, 0)]}, 2
+    )
+    assert sorted(capped["exclude"]) == [(2, 1, 0), (2, 2, 0)]
+
+    # the derivative slot only ever holds 0 or 1
+    deriv = sindy_utils._normalise_spec(
+        {"degree": 2, "interactions_degree": 1, "exclude": [(1, 0, True)]}, 2
+    )
+    assert sorted(deriv["exclude"]) == [(1, 0, 1)]
+
+    # a wildcard reaches both families, and spares the variable-absent term
+    model = sindy.SINDy(
+        n_states=2, library={"degree": 2, "interactions_degree": 2,
+                             "exclude": [(True, 0, 0)]}
+    )
+    allowed = set(allowed_terms(model))
+    assert not ({"x0", "x0*x0"} & allowed)  # every pure power of x0 is gone
+    assert "x0*dx_k" in allowed  # but the interaction family is untouched
+
+    # `True == 1`, so a literal power of 1 must not be read as the wildcard
+    literal = sindy_utils._normalise_spec({"degree": 3, "exclude": [(2, 1, 0)]}, 2)
+    assert sorted(literal["exclude"]) == [(2, 1, 0)]

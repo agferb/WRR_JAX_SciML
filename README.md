@@ -37,6 +37,7 @@ python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 | `src/models.py` | `Autoencoder` and parameter-counting helpers |
 | `src/ude.py` | UDE vector fields, the Diffrax `solve` wrapper, multiple shooting, `freeze_mechanistic` |
 | `src/sindy.py` | `SINDy` class: per-equation libraries with five levels of control (total degree, per-variable degree, term exclusions, derivative interactions, per-variable interaction degree), control variables, jittable STLSQ (Lineax solves), the SINDy-PI parallel-implicit sweep, candidate scoring and rational-form recovery |
+| `src/sindy_utils.py` | Helpers behind `SINDy`: the jittable STLSQ solver (Lineax least squares, masked pruning) and library-spec normalisation |
 | `src/train.py` | Optax training loop with partial-freezing support |
 | `examples/lotka_volterra_ude.py` | Full pipeline: fit a UDE, then recover its closure symbolically |
 | `examples/michaelis_menten_sindy_pi.py` | SINDy-PI: recover a rational ODE that no explicit library can represent |

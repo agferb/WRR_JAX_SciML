@@ -7,6 +7,8 @@ Implicit formulation is implemented. The STLSQ loop prunes terms by
 masking columns, keeping shapes static and enabling custom libraries.
 
 PDEs or higher derivative equations are not supported.
+
+The solver and the library-spec normaliser live in `sindy_utils.py`.
 """
 
 import itertools
@@ -14,100 +16,9 @@ from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
-import lineax as lx
 from jaxtyping import Array, Bool, Float, Int
 
-_SPEC_KEYS = {
-    "degree",
-    "var_degree",
-    "exclude",
-    "bias",
-    "interactions_degree",
-    "var_interactions_degree",
-}
-
-
-def _lstsq(A: Float[Array, "m n"], b: Float[Array, " m"]) -> Float[Array, " n"]:
-    """Least-squares solve of A @ x ~ b via Lineax."""
-    operator = lx.MatrixLinearOperator(A)
-    solution = lx.linear_solve(
-        operator, b, solver=lx.AutoLinearSolver(well_posed=False)
-    )
-    return solution.value
-
-
-def _stlsq_one(
-    theta: Float[Array, "samples features"],
-    y: Float[Array, " samples"],
-    allowed: Bool[Array, " features"],
-    threshold: float,
-    max_iters: int,
-) -> Float[Array, " features"]:
-    """
-    Sequentially thresholded least-squares fit for 1 library term
-
-    The loop exits when least-square results settle or when
-    `max_iters` is reached.
-    """
-    coef = jnp.where(allowed, _lstsq(theta * allowed[None, :], y), 0.0)
-
-    def cond(carry):
-        _, mask, previous, i = carry
-        return (i < max_iters) & jnp.any(mask != previous)
-
-    def body(carry):
-        coef, mask, _, i = carry
-        new = mask & (jnp.abs(coef) >= threshold)
-        coef = jnp.where(new, _lstsq(theta * new[None, :], y), 0.0)
-        return coef, new, mask, i + 1
-
-    coef, *_ = jax.lax.while_loop(cond, body, (coef, allowed, ~allowed, 0))
-    return coef
-
-
-@jax.jit(static_argnames=("max_iters",))
-def _stlsq(
-    thetas: Float[Array, "groups samples features"],
-    Ys: Float[Array, "groups samples targets"],
-    masks: Bool[Array, "groups targets features"],
-    threshold: float = 0.1,
-    max_iters: int = 20,
-) -> Float[Array, "groups features targets"]:
-    """
-    STLSQ vmapped over targets (inner) and equation groups (outer).
-
-    Explicit mode passes one group of `n_states` targets; SINDy-PI sweep passes
-    `n_states` groups, each regressing every library column on the others.
-    """
-
-    def over_targets(theta, Y, mask, threshold, max_iters):
-        return jax.vmap(_stlsq_one, in_axes=(None, 1, 0, None, None), out_axes=1)(
-            theta, Y, mask, threshold, max_iters
-        )
-
-    return jax.vmap(over_targets, in_axes=(0, 0, 0, None, None))(
-        thetas, Ys, masks, threshold, max_iters
-    )
-
-
-def _normalise_spec(spec: dict, n_vars: int) -> dict:
-    """Fill a library spec's optional keys and pad `exclude` to `n_vars + 1`."""
-    unknown = set(spec) - _SPEC_KEYS
-    if unknown:
-        raise ValueError(
-            f"unknown library key(s) {sorted(unknown)}; "
-            f"expected any of {sorted(_SPEC_KEYS)}"
-        )
-    exclude = spec.get("exclude") or ()
-    padded = {tuple(e) + (0,) * (n_vars + 1 - len(e)) for e in exclude}
-    return {
-        "degree": spec["degree"],
-        "var_degree": spec.get("var_degree"),
-        "interactions_degree": spec.get("interactions_degree"),
-        "var_interactions_degree": spec.get("var_interactions_degree"),
-        "exclude": padded,
-        "bias": spec.get("bias", True),
-    }
+from src.sindy_utils import _normalise_spec, _stlsq
 
 
 class SINDy:
@@ -115,10 +26,8 @@ class SINDy:
     Sparse identification of nonlinear dynamics over a polynomial library.
 
     `n_states` is the number of dynamic state variables, `n_controls` the number
-    of exogenous ones: controls build the library but get no equation of their
-    own. `var_names` lists the states first, then the controls, and every
-    positional tuple below is indexed the same way over
-    `n_variables = n_states + n_controls`.
+    of exogenous ones. `var_names` lists the states first, then the controls, and
+    every positional tuple below is indexed the same way over.
 
     `library` is one spec dict shared by every equation, or a list of `n_states`
     dicts giving each equation its own library over shared columns. A spec has
@@ -128,41 +37,44 @@ class SINDy:
             "degree": 3,                            # (i)   required
             "var_degree": (2, 1, 3),                # (ii)  optional
             "exclude": [(3, 0, 0), (0, 1, 2)],      # (iii) optional
-            "bias": True,                           #       optional, default True
-            "interactions_degree": 1,               # (iv)  optional, implicit only
-            "var_interactions_degree": (1, 1, 0),   # (v) optional, implicit only
+            "bias": True,                           # (iv)  optional, default True
+            "interactions_degree": 1,               # (v)   optional, implicit only
+            "var_interactions_degree": (1, 1, 0),   # (vi)  optional, implicit only
         }
 
-    (i)   `degree` bounds a monomial's total degree.
-    (ii)  `var_degree` bounds each variable's own power, still capped by
-          `degree`. A tuple of length `n_variables`, positional: entry `i` is the
-          highest power variable `i` may take. Omit to let every variable reach
-          `degree`.
-    (iii) `exclude` drops individual terms. Each entry is an exponent vector,
-          positional: `(3, 0, 0)` is `x0**3` and `(0, 1, 2)` is `x1 * x2**2`. A
-          trailing entry may be added for the derivative factor, so `(1, 0, 1)`
-          is `x0 * dx_k`; short vectors are zero-padded. Omit to drop nothing.
-    (iv)  `interactions_degree` bounds the total degree of the monomial
-          multiplying the equation's own derivative, which is what makes the
-          library implicit. The derivative factor itself is not counted by
-          `degree`. `0` admits the bare `dx_k` column alone; omit for no
-          derivative terms at all (the explicit library).
-    (v)   `var_interactions_degree` bounds each variable's power inside an
-          interaction monomial. It does not inherit from `var_degree` -- the two
-          families have independent caps.
+    (i)     `degree` bounds a monomial's total degree.
 
-    `bias` gates only the constant column `1`. The bare `dx_k` column is
-    governed by `interactions_degree` instead, so a library may carry the
-    standalone derivative (`interactions_degree=0`).
+    (ii)    `var_degree` bounds each variable's own power, still capped by`degree`.
+            A tuple of length `n_variables`, positional: entry `i` is the highest
+            power variable `i` may take. Omit to let every variable reach `degree`.
 
+    (iii)   `exclude` drops individual terms. Each entry is an exponent vector,
+            positional: `(3, 0, 0)` is `x0**3` and `(0, 1, 2)` is `x1 * x2**2`. A
+            trailing entry may be added for the derivative factor, so `(1, 0, 1)`
+            is `x0 * dx_k`. `True` in a slot is a wildcard for "present at any
+            power", so with `degree=3` the entry (2, True, 0) unfolds to (2, 1, 0),
+            (2, 2, 0) and (2, 3, 0), but leaves (2, 0, 0). A more restrictive
+            `var_degree` (or `var_interactions_degree`) caps the unfolding. Pass
+            `exclude` as a list, not a set.
+
+    (iv)    `bias` sets the independent term, and does not influence on the
+            presence of any other term.
+
+    (v)     `interactions_degree` bounds the total degree of the monomial
+            multiplying the equation's own derivative, which is what makes the
+            library implicit. The derivative factor itself is not counted by
+            `degree`. `0` admits the bare `dx_k` column alone; omit for no
+            derivative terms at all (the explicit library).
+
+    (vi)    `var_interactions_degree` bounds each variable's power inside an
+            interaction monomial. It does not inherit from `var_degree` -- the
+            two families have independent caps.
+
+    All tuples in defining the library must have lenght `n_variables` = `n_states`
+    + `n_controls`. Check `library_terms()` before solving if a fit looks off.
+    DO NOT use `exclude` to drop the bias term; set `bias=False` instead.
+    
     Set `implicit=True` to run the SINDy-PI sweep (needs `interactions_degree`).
-
-    Both `var_degree` and `var_interactions_degree` must have length
-    `n_variables`, not `n_states`: a short tuple is silently truncated by `zip`,
-    leaving the trailing controls uncapped with no error. `exclude` vectors are
-    padded, so those are safe at either length. Check `library_terms()` before
-    solving if a fit looks off. DO NOT use `exclude` to drop the bias term; set
-    `bias=False` instead.
     """
 
     def __init__(
@@ -239,12 +151,16 @@ class SINDy:
         )
 
     def _name(self, combo: tuple[int, ...], deriv: str) -> str:
+
         """Render one monomial, writing the sentinel index as `deriv`."""
+
         parts = [deriv if i == self.n_variables else self.var_names[i] for i in combo]
         return "*".join(parts) if parts else "1"
 
     def _allows(self, spec: dict, combo: tuple[int, ...]) -> bool:
+
         """Whether one equation's library admits `combo`, across all levels."""
+
         # Exponent vector: entry i is the power of variable i, the last entry the
         # power of the equation's own derivative.
         exponents = tuple(combo.count(i) for i in range(self.n_variables + 1))
@@ -273,7 +189,9 @@ class SINDy:
         return all(e <= cap for e, cap in zip(monomial, var_cap))
 
     def library_terms(self) -> str:
+
         """The terms each equation's library holds -- check this before solving."""
+
         lines = []
         for i in range(self.n_states):
             deriv = f"d{self.var_names[i]}"
@@ -284,26 +202,26 @@ class SINDy:
 
     def _build_theta(
         self,
-        X: Float[Array, "samples vars"],
+        Y: Float[Array, "samples vars"],
         dxdt: Float[Array, " samples"],
     ) -> Float[Array, "samples features"]:
-        """Evaluate the library on `X`, using `dxdt` for the derivative column."""
-        # The derivative column is always concatenated, so a sentinel index can
-        # never fall off the end of `vals` and silently clamp to X's last column.
-        vals = jnp.concatenate([X, dxdt[:, None]], axis=1)
+
+        """Evaluate the library on `Y`, using `dxdt` for the derivative column."""
+
+        vals = jnp.concatenate([Y, dxdt[:, None]], axis=1)
         cols = [
-            jnp.prod(vals[:, list(c)], axis=1) if c else jnp.ones(X.shape[0])
+            jnp.prod(vals[:, list(c)], axis=1) if c else jnp.ones(Y.shape[0])
             for c in self._combos
         ]
         return jnp.stack(cols, axis=1)
 
     def _build_thetas(
         self,
-        X: Float[Array, "samples vars"],
+        Y: Float[Array, "samples vars"],
         dXdt: Float[Array, "samples targets"],
     ) -> Float[Array, "equations samples features"]:
         """One theta per equation, each carrying that equation's own derivative."""
-        return jax.vmap(self._build_theta, in_axes=(None, 1))(X, dXdt)
+        return jax.vmap(self._build_theta, in_axes=(None, 1))(Y, dXdt)
 
     def _candidate_masks(self) -> Bool[Array, "equations candidates features"]:
         """Equation i's library minus candidate j: the SINDy-PI self-exclusion."""
@@ -313,23 +231,25 @@ class SINDy:
 
     def solve(
         self,
-        X: Float[Array, "samples vars"],
-        dXdt: Float[Array, "samples targets"],
+        Y: Float[Array, "samples vars"],
+        dXdt: Float[Array, "samples state derivatives"],
         threshold: float = 0.1,
         max_iters: int = 20,
     ) -> Float[Array, "..."]:
         """
         Fit sparse coefficients, running the SINDy-PI sweep when `implicit`.
+        `X` stands for the vector of state variables and `Y` stands for the
+        vector [X | U] of state and control variables.
 
         Explicit writes `coefficients_`, `(features, targets)`. Implicit writes
         `models_`, `(equations, features, candidates)`, where `models_[i, :, j]`
         is equation `i`'s model with library column `j` on the left-hand side.
         """
-        assert X.shape[1] == self.n_variables
+        assert Y.shape[1] == self.n_variables
         assert dXdt.shape[1] == self.n_states
 
         if not self.implicit:
-            theta = self._build_theta(X, jnp.zeros(X.shape[0]))
+            theta = self._build_theta(Y, jnp.zeros(Y.shape[0]))
             xi = _stlsq(
                 theta[None],
                 dXdt[None],
@@ -340,7 +260,7 @@ class SINDy:
             self.coefficients_ = xi[0]
             return self.coefficients_
 
-        thetas = self._build_thetas(X, dXdt)
+        thetas = self._build_thetas(Y, dXdt)
         self.models_ = _stlsq(
             thetas, thetas, self._candidate_masks(), threshold, max_iters
         )
@@ -404,20 +324,29 @@ class SINDy:
         self,
         X: Float[Array, "samples vars"],
         dXdt: Float[Array, "samples targets"],
+        criterion: str = 'deriv-error',
     ) -> Int[Array, " equations"]:
         """
         Pick one left-hand-side candidate per equation into `selected_`.
 
-        Lowest derivative error wins, with the sparsest model breaking ties
-        within `tol` of it -- the top candidates are usually the same relation
-        rescaled, so read the rational form rather than the winning term.
+        Can be selected according to 3 criteria:
+        - deriv-error: lowest derivative error (default)
+        - state-error: lowest error in the features fit
+        - sparsity: lowest sparsity (# of terms)
         """
-        _, deriv_fit, _ = self.scores(X, dXdt)
-        self.selected_ = jnp.min(deriv_fit, axis=1, keepdims=True)
+        criteria = ['deriv-error', 'state-error', 'sparsity']
+        assert criterion in criteria, (
+            'Criterion must be `deriv-error`, `state-error` or `sparsity`'
+            )
+        c = criteria.index(criterion)
+        scores_ = self.scores(X, dXdt)
+        self.selected_ = jnp.argmin(scores_[c], axis=1)
         return self.selected_
 
     def _relation(self, equation: int, candidate: int) -> Float[Array, " features"]:
+
         """Coefficients of `theta_j - Theta xi_j = 0` for one candidate."""
+        
         n_features = len(self._combos)
         column = jnp.eye(n_features)[:, candidate]
         return column - self.models_[equation][:, candidate]

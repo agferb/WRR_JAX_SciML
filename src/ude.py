@@ -13,7 +13,7 @@ import diffrax as dfx
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
+from jaxtyping import Array, Float, PRNGKeyArray, PyTree
 
 
 def lotka_volterra(
@@ -85,11 +85,17 @@ def solve(
     y0: Float[Array, " dim"],
     ts: Float[Array, " time"],
     *,
+    args: PyTree = None,
     rtol: float = 1e-6,
     atol: float = 1e-8,
     max_steps: int = 4096,
 ) -> Float[Array, "time dim"]:
-    """Integrate `vector_field` from `ts[0]` to `ts[-1]`, saving at `ts`."""
+    """Integrate `vector_field` from `ts[0]` to `ts[-1]`, saving at `ts`.
+
+    `args` is passed through to `vector_field(t, y, args)` as any PyTree; it is
+    keyword-only because vector fields here ignore an `args` they do not use, so
+    a misplaced positional would be swallowed rather than raise.
+    """
     sol = dfx.diffeqsolve(
         dfx.ODETerm(vector_field),
         dfx.Tsit5(),
@@ -97,11 +103,20 @@ def solve(
         t1=ts[-1],
         dt0=ts[1] - ts[0],
         y0=y0,
+        args=args,
         saveat=dfx.SaveAt(ts=ts),
         stepsize_controller=dfx.PIDController(rtol=rtol, atol=atol),
         max_steps=max_steps,
     )
-    return sol.ys
+
+    # Fill with NaN values if simulation is early terminated
+    ys = sol.ys
+    if ys.shape[0] < len(ts):
+        fulls = jnp.full((len(ts), len(y0)), jnp.nan)
+        fulls[: ys.shape[0]] = ys
+        ys = fulls
+
+    return ys
 
 
 def multiple_shooting_windows(
