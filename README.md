@@ -41,7 +41,8 @@ python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 | `src/train.py` | Optax training loop with partial-freezing support |
 | `examples/lotka_volterra_ude.py` | Full pipeline: fit a UDE, then recover its closure symbolically |
 | `examples/michaelis_menten_sindy_pi.py` | SINDy-PI: recover a rational ODE that no explicit library can represent |
-| `tests/test_smoke.py` | Smoke tests, including the chex/Equinox gotcha |
+| `docs/noise_models.md` | Design note: three ways to add measurement noise to synthetic trajectories, with measured trade-offs |
+| `tests/` | `test_sindy.py`, `test_ude.py`, `test_models.py` — a small suite chosen by mutation testing: each test pins a decision a future edit could reverse |
 
 ## The worked examples
 

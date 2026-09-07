@@ -49,7 +49,7 @@ class SINDy:
             power variable `i` may take. Omit to let every variable reach `degree`.
 
     (iii)   `exclude` drops individual terms. Each entry is an exponent vector,
-            positional: `(3, 0, 0)` is `x0**3` and `(0, 1, 2)` is `x1 * x2**2`. A
+            positional: `(3, 0)` is `x0**3` and `(1, 2)` is `x0 * x1**2`. A
             trailing entry may be added for the derivative factor, so `(1, 0, 1)`
             is `x0 * dx_k`. `True` in a slot is a wildcard for "present at any
             power", so with `degree=3` the entry (2, True, 0) unfolds to (2, 1, 0),
