@@ -86,7 +86,7 @@ def main():
     ys_test, dxs_test = trajectory(x0_test, t_span, dt, kLa, noise, test_key)
 
     lib = {
-        "degree": 3,
+        "degree": 4,
         "interactions_degree": 2,
         "var_degree": (2, 2, 2, 1),
         "var_interactions_degree": (2, 2, 2, 0),

@@ -334,7 +334,7 @@ class SINDy:
         - state-error: lowest error in the features fit
         - sparsity: lowest sparsity (# of terms)
         """
-        criteria = ['deriv-error', 'state-error', 'sparsity']
+        criteria = ['state-error', 'deriv-error', 'sparsity']
         assert criterion in criteria, (
             'Criterion must be `deriv-error`, `state-error` or `sparsity`'
             )
