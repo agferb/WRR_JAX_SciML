@@ -12,6 +12,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+from jax.numpy import inf
 from jaxtyping import Array, Float, PRNGKeyArray
 
 from src import sindy, ude
@@ -77,7 +78,7 @@ def main():
     t_span = (0.0, 10.0)  # d
     x0_train = jnp.array([0, 15, 0])  # [gCOD/m3]
     x0_test = jnp.array([25, 40, 0])  # [gCOD/m3]
-    noise = 0.0 # 0.05
+    noise = 0.0  # 0.05
     threshold = 0.001
 
     kLa = lambda t: jnp.clip(6 * (t - 1), 0, 7)
@@ -85,25 +86,37 @@ def main():
     ys_train, dxs_train = trajectory(x0_train, t_span, dt, kLa, noise, train_key)
     ys_test, dxs_test = trajectory(x0_test, t_span, dt, kLa, noise, test_key)
 
+    n_states = 3
+    n_controls = 1
+    var_names = ["s", "x", "o", "u"]
     lib = {
         "degree": 4,
         "interactions_degree": 2,
         "var_degree": (2, 2, 2, 1),
         "var_interactions_degree": (2, 2, 2, 0),
         "bias": True,
-        "exclude": [(0, True, 0, 1), (True, True, 0, 1), (0, True, True, 1)],
+        "exclude": [
+            (inf, True, inf, 1),
+            (1, 2, 1, 0),
+            (2, 2, 0, 0),
+            (2, 0, 2, 0),
+            (0, 2, 2, 0),
+        ],
     }
     model = sindy.SINDy(
-        n_states=3,
+        n_states=n_states,
         library=lib,
-        n_controls=1,
-        var_names=["s", "x", "o", "u"],
+        n_controls=n_controls,
+        var_names=var_names,
         implicit=True,
     )
-    model.solve(ys_train, dxs_train, threshold=threshold)
 
+    lib_terms = model.library_terms()
     print(f"Library swept ({len(model.feature_names)} candidates per equation):")
-    print(f"  {model.library_terms()}")
+    for lib, state in enumerate(lib_terms):
+        print(f"\n{state}:  {lib}")
+
+    model.solve(ys_train, dxs_train, threshold=threshold)
 
     # Selection by best derivative error
     _, deriv_fit, _ = model.scores(ys_test, dxs_test)

@@ -53,9 +53,10 @@ class SINDy:
             trailing entry may be added for the derivative factor, so `(1, 0, 1)`
             is `x0 * dx_k`. `True` in a slot is a wildcard for "present at any
             power", so with `degree=3` the entry (2, True, 0) unfolds to (2, 1, 0),
-            (2, 2, 0) and (2, 3, 0), but leaves (2, 0, 0). A more restrictive
-            `var_degree` (or `var_interactions_degree`) caps the unfolding. Pass
-            `exclude` as a list, not a set.
+            (2, 2, 0) and (2, 3, 0), but leaves (2, 0, 0). `inf` is the same
+            wildcard widened to power 0, so (2, inf, 0) drops (2, 0, 0) too. A
+            more restrictive `var_degree` (or `var_interactions_degree`) caps the
+            unfolding. Pass `exclude` as a list, not a set.
 
     (iv)    `bias` sets the independent term, and does not influence on the
             presence of any other term.
@@ -188,17 +189,20 @@ class SINDy:
             return True
         return all(e <= cap for e, cap in zip(monomial, var_cap))
 
-    def library_terms(self) -> str:
+    def library_terms(self) -> dict[str, list[str]]:
 
-        """The terms each equation's library holds -- check this before solving."""
+        """
+        The terms each equation's library holds -- check this before solving.
+        Keyed by the equation's derivative, `d{var_name}`.
+        """
 
-        lines = []
+        lines = {}
         for i in range(self.n_states):
             deriv = f"d{self.var_names[i]}"
             names = [self._name(c, deriv) for c in self._combos]
             allowed = [n for n, ok in zip(names, self.library_mask[i]) if ok]
-            lines.append(f"{deriv}: {', '.join(allowed)}")
-        return "\n".join(lines)
+            lines[deriv] = allowed
+        return lines
 
     def _build_theta(
         self,

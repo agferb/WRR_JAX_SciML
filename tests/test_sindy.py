@@ -183,8 +183,10 @@ def test_libraries_may_differ_per_equation():
     assert not bool(split.library_mask[1, names.index("1")])
     assert not bool(split.library_mask[1, names.index("x*z")])
     assert bool(split.library_mask[0, names.index("x*z")])
-    # library_terms() reports the mask, not the union library
-    assert "x*z" not in split.library_terms().splitlines()[1]
+    # library_terms() reports the mask, not the union library, one entry per
+    # equation keyed by its derivative
+    terms = split.library_terms()
+    assert "x*z" in terms["dx"] and "x*z" not in terms["dz"]
 
     xi = split.solve(X[:, :2], dX, threshold=0.1)
     assert bool(jnp.all(jnp.abs(xi.T[~split.library_mask]) == 0.0))
@@ -444,3 +446,31 @@ def test_exclude_wildcard_unfolds_over_every_power():
     # `True == 1`, so a literal power of 1 must not be read as the wildcard
     literal = sindy_utils._normalise_spec({"degree": 3, "exclude": [(2, 1, 0)]}, 2)
     assert sorted(literal["exclude"]) == [(2, 1, 0)]
+
+
+def test_exclude_inf_wildcard_reaches_power_zero():
+    """`inf` is the `True` wildcard widened to the variable being absent."""
+    spec = sindy_utils._normalise_spec(
+        {"degree": 3, "exclude": [(2, jnp.inf, 0)]}, 2
+    )
+    assert sorted(spec["exclude"]) == [(2, 0, 0), (2, 1, 0), (2, 2, 0), (2, 3, 0)]
+
+    # the same per-variable caps bound it as they bound `True`
+    capped = sindy_utils._normalise_spec(
+        {"degree": 3, "var_degree": (3, 1), "exclude": [(2, jnp.inf, 0)]}, 2
+    )
+    assert sorted(capped["exclude"]) == [(2, 0, 0), (2, 1, 0)]
+
+    # the derivative slot holds 0 or 1, so `inf` there spans both families
+    deriv = sindy_utils._normalise_spec(
+        {"degree": 2, "interactions_degree": 1, "exclude": [(1, 0, jnp.inf)]}, 2
+    )
+    assert sorted(deriv["exclude"]) == [(1, 0, 0), (1, 0, 1)]
+
+    model = sindy.SINDy(
+        n_states=2, library={"degree": 2, "interactions_degree": 2,
+                             "exclude": [(1, jnp.inf, 0)]}
+    )
+    allowed = set(allowed_terms(model))
+    assert not ({"x0", "x0*x1"} & allowed)  # x0**1 is gone whatever x1 does
+    assert {"x0*x0", "x0*dx_k"} <= allowed  # other powers and the derivative stay

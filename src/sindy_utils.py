@@ -119,17 +119,22 @@ def _slot_cap(spec: dict, slot: int, n_vars: int) -> int:
 
 
 def _expand_exclusion(
-    entry: tuple[int | bool, ...], spec: dict, n_vars: int
+    entry: tuple[int | bool | float, ...], spec: dict, n_vars: int
 ) -> list[tuple[int, ...]]:
 
-    """Unfold `True` slots into every power that variable could take."""
+    """
+    Unfold `True` slots into every power that variable could take.
+    Unfold `inf` slots into every power that variable could take and 0.
+    """
 
-    # `is True`, not `== True`: Python has `True == 1`, so an equality test would
-    # read a literal power of 1 as the wildcard.
-    ranges = [
-        range(1, _slot_cap(spec, slot, n_vars) + 1) if power is True else (power,)
-        for slot, power in enumerate(entry)
-    ]
+    ranges = []
+    for slot, power in enumerate(entry):
+        if power is True:
+            ranges.append(range(1, _slot_cap(spec, slot, n_vars) + 1))
+        elif power == jnp.inf:
+            ranges.append(range(_slot_cap(spec, slot, n_vars) + 1))
+        else:
+            ranges.append((power,))
     return list(itertools.product(*ranges))
 
 
