@@ -74,8 +74,8 @@ def main(n_points: int, t_end: float, y0: float, threshold: float):
     print("\nSame data, library padded by one degree (degree=4, interactions=2):")
     print(f"  {loose.equations()}")
     print(
-        f"  error {float(loose_deriv_fit[0, loose_selected]):.2e} -- small, but"
-        " the form carries spurious quadratic terms."
+        f"  error {float(loose_deriv_fit[0, loose_selected]):.2e} -- normalisation"
+        " prunes the R*(1 + a*x) family here; normalise=False does not."
     )
 
 

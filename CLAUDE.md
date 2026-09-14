@@ -27,8 +27,18 @@ Extends `src/sindy.py` with the SINDy-PI parallel-implicit formulation
   guarded.
 - `candidates()` returns data (one dict per equation with `term` / `error` /
   `explicit_form`), and `equations(payload)` renders it. `top=None` keeps all.
+- `solve(..., normalise=True)` (default) scales `_stlsq`'s columns and targets
+  to unit 2-norm before fitting and un-scales the result, so `threshold` reads
+  as a dimensionless fraction of the target rather than a raw coefficient
+  magnitude -- this changes behaviour vs `master`, not just lowering. Pass
+  `normalise=False` for `master`'s absolute-magnitude semantics.
+- `SINDy.conditioning(Y, dXdt) -> list[dict]` / `.diagnostics(payload) -> str`
+  report per-equation rank, condition number and column-scale span on each
+  equation's masked columns (`sindy_utils.conditioning`/`format_conditioning`
+  do the underlying SVD work over a raw matrix, given whatever columns they
+  are handed).
 
-The explicit path is unchanged in behaviour but **not** bit-identical to
-`master`: the extra vmap axis changes XLA's lowering, moving float32
+The explicit path is otherwise unchanged in behaviour but **not** bit-identical
+to `master`: the extra vmap axis changes XLA's lowering, moving float32
 coefficients by ~7e-7 (~2e-7 relative). `examples/lotka_volterra_ude.py` prints
 the same values to four decimals.

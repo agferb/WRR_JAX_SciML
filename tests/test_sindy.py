@@ -237,16 +237,63 @@ def test_stlsq_converges_and_respects_the_threshold():
     # this system needs a second pass, so a loop that stopped early would differ
     assert not jnp.allclose(settled, model.solve(X, dX, threshold=0.1, max_iters=1))
 
-    # thresholding prunes on coefficient magnitude: the true `u` coefficient is 1.0
+    # normalised thresholding prunes on a fraction of the target, not a raw
+    # magnitude: the true `u` coefficient is 1.0, but the pruning boundary
+    # moves with normalisation
     Xc, dXc = known_system(200)
     controlled = sindy.SINDy(
         n_states=2, library={"degree": 3}, n_controls=1, var_names=["x", "z", "u"]
     )
     names = controlled.feature_names
-    assert float(controlled.solve(Xc, dXc, threshold=1.5)[names.index("u"), 1]) == 0.0
-    assert controlled.solve(Xc, dXc, threshold=0.5)[
+    assert float(controlled.solve(Xc, dXc, threshold=0.6)[names.index("u"), 1]) == 0.0
+    assert controlled.solve(Xc, dXc, threshold=0.2)[
         names.index("u"), 1
     ] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_badly_scaled_column_needs_normalisation():
+    """Regression test for the root cause: a huge raw column magnitude hides a
+    legitimately tiny raw coefficient from an absolute threshold."""
+    X, dX = known_system(300)
+    Xs = X.at[:, 2].multiply(1e6)  # `u` column now 1e6x its natural scale
+    model = sindy.SINDy(
+        n_states=2, library={"degree": 1}, n_controls=1, var_names=["x", "z", "u"]
+    )
+    names = model.feature_names
+    xi_n = model.solve(Xs, dX, threshold=0.1, normalise=True)
+    xi_r = model.solve(Xs, dX, threshold=0.1, normalise=False)
+    assert xi_n[names.index("u"), 1] == pytest.approx(1e-6, rel=1e-2)
+    assert xi_r[names.index("u"), 1] == 0.0
+
+
+def test_conditioning_reports_masked_columns_and_ill_conditioning():
+    X, dX = known_system(300)
+    model = sindy.SINDy(
+        n_states=2,
+        library=[{"degree": 3}, {"degree": 3, "exclude": [(0, 1, 0)]}],
+        n_controls=1,
+        var_names=["x", "z", "u"],
+    )
+    report = model.conditioning(X, dX)
+    for i in range(2):
+        assert report[i]["n_admitted"] == int(jnp.sum(model.library_mask[i]))
+    assert report[0]["n_admitted"] != report[1]["n_admitted"]
+
+    key = jax.random.key(0)
+    col = jax.random.normal(key, (50,))
+    theta = jnp.stack(
+        [col, col * (1 + 1e-8), jax.random.normal(jax.random.key(1), (50,))], axis=1
+    )
+    ill = sindy_utils.conditioning(theta)
+    assert ill["kappa_eps"] > 1
+    assert ill["eps"] == pytest.approx(float(jnp.finfo(jnp.float32).eps))
+
+    jax.config.update("jax_enable_x64", True)
+    try:
+        report64 = sindy_utils.conditioning(theta.astype(jnp.float64))
+    finally:
+        jax.config.update("jax_enable_x64", False)
+    assert report64["eps"] < ill["eps"]
 
 
 def test_solve_is_jittable_and_survives_total_pruning():

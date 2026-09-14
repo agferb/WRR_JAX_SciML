@@ -17,6 +17,9 @@ from jaxtyping import Array, Float, PRNGKeyArray
 
 from src import sindy, ude
 
+# (UN)COMMENT FOR BETTER (PARALELIZATION) FLOAT-POINT PRECISION
+jax.config.update("jax_enable_x64", True)
+
 T = dict(
     D=3.0,  # d-1
     S_in=100,  # gCOD/m3.d
@@ -78,8 +81,8 @@ def main():
     t_span = (0.0, 10.0)  # d
     x0_train = jnp.array([0, 15, 0])  # [gCOD/m3]
     x0_test = jnp.array([25, 40, 0])  # [gCOD/m3]
-    noise = 0.0  # 0.05
-    threshold = 0.001
+    noise = 0.05  # 0.05
+    threshold = 0.01  # fraction of target, under default column normalisation
 
     kLa = lambda t: jnp.clip(6 * (t - 1), 0, 7)
     train_key, test_key = jax.random.split(jax.random.key(0))
@@ -113,10 +116,13 @@ def main():
 
     lib_terms = model.library_terms()
     print(f"Library swept ({len(model.feature_names)} candidates per equation):")
-    for lib, state in enumerate(lib_terms):
-        print(f"\n{state}:  {lib}")
+    for state, terms in lib_terms.items():
+        print(f"\n{state}:  {terms}")
 
-    model.solve(ys_train, dxs_train, threshold=threshold)
+    print("\nConditioning report (train trajectory, admitted columns per equation):")
+    print(model.conditioning(ys_train, dxs_train, report=True))
+
+    model.solve(ys_train, dxs_train, threshold=threshold, normalise=True)
 
     # Selection by best derivative error
     _, deriv_fit, _ = model.scores(ys_test, dxs_test)

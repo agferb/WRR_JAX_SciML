@@ -16,9 +16,15 @@ from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
+from jaxlib.mlir.ir import Diagnostic
 from jaxtyping import Array, Bool, Float, Int
 
-from src.sindy_utils import _normalise_spec, _stlsq
+from src.sindy_utils import (
+    _normalise_spec,
+    _stlsq,
+    conditioning as _conditioning,
+    format_conditioning,
+)
 
 
 class SINDy:
@@ -76,6 +82,9 @@ class SINDy:
     DO NOT use `exclude` to drop the bias term; set `bias=False` instead.
     
     Set `implicit=True` to run the SINDy-PI sweep (needs `interactions_degree`).
+
+    `solve`'s STLSQ normalises columns and targets by default, so its
+    `threshold` is a dimensionless fraction of the target, not a raw magnitude.
     """
 
     def __init__(
@@ -239,6 +248,7 @@ class SINDy:
         dXdt: Float[Array, "samples state derivatives"],
         threshold: float = 0.1,
         max_iters: int = 20,
+        normalise: bool = True,
     ) -> Float[Array, "..."]:
         """
         Fit sparse coefficients, running the SINDy-PI sweep when `implicit`.
@@ -248,6 +258,8 @@ class SINDy:
         Explicit writes `coefficients_`, `(features, targets)`. Implicit writes
         `models_`, `(equations, features, candidates)`, where `models_[i, :, j]`
         is equation `i`'s model with library column `j` on the left-hand side.
+
+        `normalise` = True scales columns and targets to unit norm.
         """
         assert Y.shape[1] == self.n_variables
         assert dXdt.shape[1] == self.n_states
@@ -260,15 +272,43 @@ class SINDy:
                 self.library_mask[None],
                 threshold,
                 max_iters,
+                normalise,
             )
             self.coefficients_ = xi[0]
             return self.coefficients_
 
         thetas = self._build_thetas(Y, dXdt)
         self.models_ = _stlsq(
-            thetas, thetas, self._candidate_masks(), threshold, max_iters
+            thetas, thetas, self._candidate_masks(), threshold, max_iters, normalise
         )
         return self.models_
+
+    def conditioning(
+        self,
+        Y: Float[Array, "samples vars"],
+        dXdt: Float[Array, "samples state derivatives"],
+        report: bool = True,
+    ) -> list[dict]:
+        """
+        Per-equation conditioning report on each equation's admitted columns.
+        `report` = True returns printed diagnostics instead of array values.
+        """
+        if self.implicit:
+            thetas = self._build_thetas(Y, dXdt)
+            columns = [thetas[i][:, self.library_mask[i]] for i in range(self.n_states)]
+        else:
+            theta = self._build_theta(Y, jnp.zeros(Y.shape[0]))
+            columns = [theta[:, self.library_mask[i]] for i in range(self.n_states)]
+        diagnostics = [
+            _conditioning(columns[i], dXdt[:, i]) for i in range(self.n_states)
+        ]
+
+        if report:
+            return "\n\n".join(
+            f"d{self.var_names[i]}:\n{format_conditioning(diagnostics[i])}"
+            for i in range(self.n_states)
+        )
+        return diagnostics 
 
     def scores(
         self,

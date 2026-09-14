@@ -29,7 +29,6 @@ _SPEC_KEYS = {
 
 
 def _lstsq(A: Float[Array, "m n"], b: Float[Array, " m"]) -> Float[Array, " n"]:
-
     """Least-squares solve of A @ x ~ b via Lineax."""
 
     operator = lx.MatrixLinearOperator(A)
@@ -68,19 +67,22 @@ def _stlsq_one(
     return coef
 
 
-@jax.jit(static_argnames=("max_iters",))
+@jax.jit(static_argnames=("max_iters", "normalise"))
 def _stlsq(
     thetas: Float[Array, "groups samples features"],
     Ys: Float[Array, "groups samples targets"],
     masks: Bool[Array, "groups targets features"],
     threshold: float = 0.1,
     max_iters: int = 20,
+    normalise: bool = True,
 ) -> Float[Array, "groups features targets"]:
     """
     STLSQ vmapped over targets (inner) and equation groups (outer).
 
     Explicit mode passes one group of `n_states` targets; SINDy-PI sweep passes
     `n_states` groups, each regressing every library column on the others.
+    With `normalise`, columns and targets are scaled to unit 2-norm before the
+    fit and un-scaled after, so `threshold` reads as a dimensionless fraction.
     """
 
     def over_targets(theta, Y, mask, threshold, max_iters):
@@ -88,16 +90,129 @@ def _stlsq(
             theta, Y, mask, threshold, max_iters
         )
 
-    return jax.vmap(over_targets, in_axes=(0, 0, 0, None, None))(
+    if normalise:
+        col = jnp.linalg.norm(thetas, axis=1)  # (groups, features)
+        tgt = jnp.linalg.norm(Ys, axis=1)  # (groups, targets)
+        col = jnp.where(col > 0, col, 1.0)
+        tgt = jnp.where(tgt > 0, tgt, 1.0)
+        thetas = thetas / col[:, None, :]
+        Ys = Ys / tgt[:, None, :]
+
+    xi = jax.vmap(over_targets, in_axes=(0, 0, 0, None, None))(
         thetas, Ys, masks, threshold, max_iters
     )
+
+    if normalise:
+        xi = xi * tgt[:, None, :] / col[:, :, None]
+
+    return xi
+
+
+# --- conditioning diagnostics ------------------------------------------------
+
+
+def conditioning(
+    theta: Float[Array, "samples features"],
+    dxdt: Float[Array, " samples"] | None = None,
+) -> dict:
+    """
+    Column scale, spectrum, rank and precision diagnostics for one matrix.
+
+    `theta` should already be sliced to one equation's admitted columns.
+    `dxdt`, if given, adds a `settled` entry: the fraction of samples with
+    `|dx/dt|` below 1% of its peak, and the first index after which it stays
+    below that for good.
+    """
+    n_samples, n_admitted = theta.shape
+    eps = float(jnp.finfo(theta.dtype).eps)
+    col_scale = jnp.linalg.norm(theta, axis=0)
+    normalised = theta / jnp.where(col_scale > 0, col_scale, 1.0)
+
+    sigma_raw = jnp.linalg.svd(theta, compute_uv=False)
+    sigma = jnp.linalg.svd(normalised, compute_uv=False)
+    tol = sigma[0] * max(n_samples, n_admitted) * eps
+    rank = int(jnp.sum(sigma > tol))
+
+    kappa_raw = float(sigma_raw[0] / sigma_raw[-1])
+    kappa_normalised = float(sigma[0] / sigma[-1])
+    kappa_eps = kappa_normalised * eps
+
+    report = {
+        "n_samples": int(n_samples),
+        "n_admitted": int(n_admitted),
+        "col_scale_min": float(jnp.min(col_scale)),
+        "col_scale_max": float(jnp.max(col_scale)),
+        "col_scale_span": float(jnp.max(col_scale) / jnp.min(col_scale)),
+        "sigma": [float(s) for s in sigma / sigma[0]],
+        "kappa_raw": kappa_raw,
+        "kappa_normalised": kappa_normalised,
+        "rank": rank,
+        "eps": eps,
+        "kappa_eps": kappa_eps,
+        "digits_lost": float(jnp.log10(kappa_normalised)),
+    }
+
+    if dxdt is not None:
+        active = jnp.abs(dxdt) > 0.01 * jnp.max(jnp.abs(dxdt))
+        idx = jnp.where(active, jnp.arange(dxdt.shape[0]), -1)
+        last_active = int(jnp.max(idx))
+        report["settled"] = {
+            "fraction": float(jnp.mean(~active)),
+            "from": last_active + 1 if last_active >= 0 else 0,
+        }
+
+    return report
+
+
+def format_conditioning(report: dict) -> str:
+    """Render one `conditioning()` report as a text table with spectrum and verdicts."""
+    sigma, rank, n = report["sigma"], report["rank"], len(report["sigma"])
+
+    def bar(s: float) -> str:
+        digits = -jnp.log10(s) if s > 0 else 30.0
+        return "#" * min(int(digits), 40)
+
+    around = range(max(0, rank - 2), min(n, rank + 2))
+    shown = sorted(set(range(min(3, n))) | set(around) | {n - 1})
+
+    lines = [
+        f"n_samples={report['n_samples']}  n_admitted={report['n_admitted']}  rank={rank}",
+        f"col_scale: min={report['col_scale_min']:.3e} max={report['col_scale_max']:.3e} "
+        f"span={report['col_scale_span']:.3e}",
+        f"kappa_raw={report['kappa_raw']:.3e}  kappa_normalised={report['kappa_normalised']:.3e}",
+        f"eps={report['eps']:.3e}  kappa_eps={report['kappa_eps']:.3e}  "
+        f"digits_lost={report['digits_lost']:.1f}",
+        "",
+        "  i    sigma_i/sigma_0  spectrum",
+    ]
+    prev = -1
+    for i in shown:
+        if i != prev + 1:
+            lines.append("  ...")
+        mark = "  <- numerical rank cutoff" if i == rank - 1 else ""
+        lines.append(f"{i:4d}  {sigma[i]:.3e}       {bar(sigma[i])}{mark}")
+        prev = i
+
+    if "settled" in report:
+        s = report["settled"]
+        lines.append(
+            f"settled: {s['fraction']:.1%} of samples below 1% of peak |dx/dt|, "
+            f"none after index {s['from']}"
+        )
+    sign_rank = ">" if report["n_admitted"] > rank else "<="
+    sign_kappa = ">" if report["kappa_eps"] > 1 else "<="
+    lines.append(
+        f"verdict: n_admitted ({report['n_admitted']}) {sign_rank} rank ({rank})"
+    )
+    lines.append(f"verdict: kappa_eps ({report['kappa_eps']:.3e}) {sign_kappa} 1")
+
+    return "\n".join(lines)
 
 
 # --- library spec normalisation ---------------------------------------------
 
 
 def _slot_cap(spec: dict, slot: int, n_vars: int) -> int:
-
     """Highest power `slot` can reach in any monomial this spec admits."""
 
     if slot == n_vars:  # the derivative slot: present or absent, never squared
@@ -121,7 +236,6 @@ def _slot_cap(spec: dict, slot: int, n_vars: int) -> int:
 def _expand_exclusion(
     entry: tuple[int | bool | float, ...], spec: dict, n_vars: int
 ) -> list[tuple[int, ...]]:
-
     """
     Unfold `True` slots into every power that variable could take.
     Unfold `inf` slots into every power that variable could take and 0.
@@ -139,7 +253,6 @@ def _expand_exclusion(
 
 
 def _normalise_spec(spec: dict, n_vars: int) -> dict:
-
     """Fill a library spec's optional keys and pad `exclude` to `n_vars + 1`."""
 
     unknown = set(spec) - _SPEC_KEYS
