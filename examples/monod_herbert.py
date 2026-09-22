@@ -119,7 +119,7 @@ def main():
     for state, terms in lib_terms.items():
         print(f"\n{state}:  {terms}")
 
-    print("\nConditioning report (train trajectory, admitted columns per equation):")
+    print("\nConditioning report (train trajectory, admitted columns per equation):\n")
     print(model.conditioning(ys_train, dxs_train, report=True))
 
     model.solve(ys_train, dxs_train, threshold=threshold, normalise=True)

@@ -176,35 +176,26 @@ def format_conditioning(report: dict) -> str:
     shown = sorted(set(range(min(3, n))) | set(around) | {n - 1})
 
     lines = [
-        f"n_samples={report['n_samples']}  n_admitted={report['n_admitted']}  rank={rank}",
-        f"col_scale: min={report['col_scale_min']:.3e} max={report['col_scale_max']:.3e} "
-        f"span={report['col_scale_span']:.3e}",
-        f"kappa_raw={report['kappa_raw']:.3e}  kappa_normalised={report['kappa_normalised']:.3e}",
-        f"eps={report['eps']:.3e}  kappa_eps={report['kappa_eps']:.3e}  "
-        f"digits_lost={report['digits_lost']:.1f}",
+        f"n_samples = {report['n_samples']}   "
+        f"n_admitted = {report['n_admitted']}   rank = {rank}",
+        f"col_scale:   min = {report['col_scale_min']:.3e}   "
+        f"max = {report['col_scale_max']:.3e}   "
+        f"span = {report['col_scale_span']:.3e}",
         "",
-        "  i    sigma_i/sigma_0  spectrum",
+        f"kappa_raw = {report['kappa_raw']:.3e}   "
+        f"kappa_normalised = {report['kappa_normalised']:.3e}",
+        f"eps = {report['eps']:.3e}   kappa x eps = {report['kappa_eps']:.3e}   "
+        f"digits_lost = {report['digits_lost']:.1f}",
+        "",
+        f"numerical rank cut-off:  {sigma[int(rank)-1]:.3e} -> {sigma[int(rank)]:.3e}",
     ]
-    prev = -1
-    for i in shown:
-        if i != prev + 1:
-            lines.append("  ...")
-        mark = "  <- numerical rank cutoff" if i == rank - 1 else ""
-        lines.append(f"{i:4d}  {sigma[i]:.3e}       {bar(sigma[i])}{mark}")
-        prev = i
 
     if "settled" in report:
         s = report["settled"]
         lines.append(
-            f"settled: {s['fraction']:.1%} of samples below 1% of peak |dx/dt|, "
-            f"none after index {s['from']}"
+            f"settled samples (below 1% of peak derivative) = {s['fraction']:.1%}"
         )
-    sign_rank = ">" if report["n_admitted"] > rank else "<="
-    sign_kappa = ">" if report["kappa_eps"] > 1 else "<="
-    lines.append(
-        f"verdict: n_admitted ({report['n_admitted']}) {sign_rank} rank ({rank})"
-    )
-    lines.append(f"verdict: kappa_eps ({report['kappa_eps']:.3e}) {sign_kappa} 1")
+        lines.append(f"settling index = {s['from']}")
 
     return "\n".join(lines)
 
