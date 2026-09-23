@@ -1,97 +1,133 @@
-"""Symbolic-library terms for the SymDer framework: `Linear`, `Quadratic`, `Cubic`, `SymModel`.
+"""Polynomial symbolic library and the term-summing wrapper for SymDer models.
 
-Ported from `symder_ref/symder/symder/sym_models.py`, dropping everything but
-the polynomial terms and the term-summing wrapper. Three departures from the
-reference: `SymModel` has no `dt` factor and no `time_dependence` (derivative
-data is already a true dz/dt, and controls enter through the input vector, not
-`t`); weights are zero-initialised with no `init` or `key` argument; and every
-term takes `n_out`, letting it emit fewer rows than the input width.
-
-`n_out < n_dims` means a term cannot serve as the vector field on its own --
-`odeint_zero` needs f(y) to match y's width, so the caller concatenates the
-supplied control derivative: F(y) = [f_learned(y) | du/dt].
+`PolynomialLibrary` gives the same nested library control as `src/sindy.py`
+(`degree`, `var_degree`, `exclude`, `bias`) over a flat, gather-based feature
+vector; `SymModel` sums an arbitrary list of such terms into one vector field.
+This no longer mirrors the reference's per-degree Haiku modules -- diverging
+structurally from `symder_ref` is accepted here.
 """
 
+import itertools
+from collections.abc import Sequence
+
+import equinox as eqx
 import jax.numpy as jnp
 import numpy as np
-import equinox as eqx
-from jaxtyping import Array, Bool, Float
+from jaxtyping import Array, Bool, Float, Int
 
-__all__ = ["Linear", "Quadratic", "Cubic", "SymModel"]
+from src.sindy_utils import _normalise_spec
+
+__all__ = ["PolynomialLibrary", "SymModel"]
 
 
-class Linear(eqx.Module):
-    """out[..., i] = sum_j w[i, j] * z_j + b[i].
+def _allows(spec: dict, combo: tuple[int, ...], n_dims: int, deriv: int = 0) -> bool:
+    """Whether `spec` admits `combo`, mirroring `SINDy._allows`'s explicit branch."""
+    exponents = tuple(combo.count(i) for i in range(n_dims)) + (deriv,)
+    if exponents in spec["exclude"]:
+        return False
+    total = sum(exponents[:-1])
+    if total > spec["degree"]:
+        return False
+    if total == 0:
+        return spec["bias"]
+    cap = spec["var_degree"]
+    # a short `var_degree` leaves trailing variables uncapped (`zip` truncation),
+    # inherited from `src/sindy.py` deliberately -- not guarded
+    return cap is None or all(e <= c for e, c in zip(exponents[:-1], cap))
 
-    `n_out` narrower than `n_dims` for the same reason as `Quadratic`/`Cubic`.
-    `b` is the library's constant term, not a bias in the neural-net sense.
+
+def _combos(n_dims: int, max_degree: int) -> list[tuple[int, ...]]:
+    """`[()]` then every combination with replacement, for degree 1..max_degree."""
+    combos = [()]
+    for d in range(1, max_degree + 1):
+        combos += itertools.combinations_with_replacement(range(n_dims), d)
+    return combos
+
+
+def _default_var_names(n_out: int, n_dims: int) -> list[str]:
+    """`x0..x{n_out-1}` then `u0..`, matching `src/sindy.py`'s convention."""
+    return [f"x{i}" for i in range(n_out)] + [f"u{j}" for j in range(n_dims - n_out)]
+
+
+class PolynomialLibrary(eqx.Module):
+    """Flat polynomial library: dz/dt terms as a gather over sentinel-padded monomials.
+
+    `idxm` holds, per feature, the variable indices multiplied together, right-
+    padded with the sentinel `n_dims`, which points at a constant `1.0` appended
+    to the input; the empty combo (the bias) is all sentinels, so it evaluates
+    to 1 with no special case. `mask` (bool) and `idxm` (int) are skipped by
+    `eqx.is_inexact_array` filtering, so only `w` trains; neither could be
+    `static=True` anyway, since a jnp array is unhashable -- only the plain int
+    `n_dims` can. `idxm` must stay an integer dtype: as a float it would be
+    trainable and an optimizer would silently update the indices.
     """
 
-    w: Float[Array, "n_out n_dims"]
-    b: Float[Array, " n_out"]
+    w: Float[Array, "n_out n_features"]
+    mask: Bool[Array, "n_out n_features"]
+    idxm: Int[Array, "n_features max_degree"]
+    n_dims: int = eqx.field(static=True)
 
-    def __init__(self, n_dims: int, n_out: int | None = None):
-        n_out = n_dims if n_out is None else n_out
-        self.w = jnp.zeros((n_out, n_dims))
-        self.b = jnp.zeros((n_out,))
+    def __init__(
+        self,
+        n_out: int,
+        spec: dict | Sequence[dict],
+        n_dims: int | None = None,
+    ):
+        n_dims = n_out if n_dims is None else n_dims
+        self.n_dims = n_dims
+        specs = [spec] * n_out if isinstance(spec, dict) else list(spec)
+        normalised = [_normalise_spec(s, n_dims) for s in specs]
+        for s in normalised:
+            if s["interactions_degree"] is not None or (
+                s["var_interactions_degree"] is not None
+            ):
+                raise ValueError(
+                    "PolynomialLibrary is explicit-only; got a SINDy-PI "
+                    "interactions key ('interactions_degree' or "
+                    "'var_interactions_degree')"
+                )
 
-    def __call__(
-        self, z: Float[Array, " n_dims"], t: Float[Array, ""] | None = None
-    ) -> Float[Array, " n_out"]:
-        return jnp.einsum("...j,ij->...i", z, self.w) + self.b
+        max_degree = max(s["degree"] for s in normalised)
+        combos = _combos(n_dims, max_degree)
 
-
-class Quadratic(eqx.Module):
-    """out[..., k] = sum_ij w[k, i, j] * z_i * z_j, masked to j >= i.
-
-    The mask keeps the upper-triangular half of each output row's (i, j) plane
-    so symmetric monomials (z_i*z_j == z_j*z_i) are counted once. `n_out`
-    lets the output be narrower than the input `n_dims`, for a latent vector
-    `[visible | hidden | controls]` whose control tail gets no equation.
-    """
-
-    w: Float[Array, "n_out n_dims n_dims"]
-    mask: Bool[Array, "n_dims n_dims"]
-
-    def __init__(self, n_dims: int, n_out: int | None = None):
-        n_out = n_dims if n_out is None else n_out
-        ind = np.arange(n_dims)
-        mesh = np.stack(np.meshgrid(ind, ind), -1)
-        self.mask = jnp.array(mesh[..., 0] >= mesh[..., 1])
-        self.w = jnp.zeros((n_out, n_dims, n_dims))
-
-    def __call__(
-        self, z: Float[Array, " n_dims"], t: Float[Array, ""] | None = None
-    ) -> Float[Array, " n_out"]:
-        weights = self.mask * self.w
-        return (weights * z[..., None, None, :] * z[..., None, :, None]).sum((-2, -1))
-
-
-class Cubic(eqx.Module):
-    """out[..., l] = sum_ijk w[l, i, j, k] * z_i * z_j * z_k, masked to j >= i >= k."""
-
-    w: Float[Array, "n_out n_dims n_dims n_dims"]
-    mask: Bool[Array, "n_dims n_dims n_dims"]
-
-    def __init__(self, n_dims: int, n_out: int | None = None):
-        n_out = n_dims if n_out is None else n_out
-        ind = np.arange(n_dims)
-        mesh = np.stack(np.meshgrid(ind, ind, ind), -1)
-        self.mask = jnp.array(mesh[..., 0] >= mesh[..., 1]) * jnp.array(
-            mesh[..., 1] >= mesh[..., 2]
+        self.mask = jnp.array(
+            [[_allows(s, c, n_dims) for c in combos] for s in normalised]
         )
-        self.w = jnp.zeros((n_out, n_dims, n_dims, n_dims))
+        self.idxm = jnp.array(
+            [c + (n_dims,) * (max_degree - len(c)) for c in combos], dtype=jnp.int32
+        )
+        self.w = jnp.zeros((n_out, len(combos)))
 
     def __call__(
-        self, z: Float[Array, " n_dims"], t: Float[Array, ""] | None = None
-    ) -> Float[Array, " n_out"]:
-        weights = self.mask * self.w
-        return (
-            weights
-            * z[..., None, None, None, :]
-            * z[..., None, None, :, None]
-            * z[..., None, :, None, None]
-        ).sum((-3, -2, -1))
+        self, z: Float[Array, "... n_dims"], t: Float[Array, ""] | None = None
+    ) -> Float[Array, "... n_out"]:
+        y = jnp.concatenate([z, jnp.ones(z.shape[:-1] + (1,))], axis=-1)
+        theta = jnp.prod(y[..., self.idxm], axis=-1)
+        return jnp.einsum("...f,of->...o", theta, self.mask * self.w)
+
+    def feature_names(self, var_names: list[str] | None = None) -> list[str]:
+        """One name per column, e.g. "1", "x0", "x1*x2", recovered from `idxm`."""
+        n_out, n_dims = self.w.shape[0], self.n_dims
+        names = var_names or _default_var_names(n_out, n_dims)
+        return [
+            "*".join(names[i] for i in row if i != n_dims) or "1"
+            for row in np.asarray(self.idxm).tolist()
+        ]
+
+    def library_terms(self, var_names: list[str] | None = None) -> dict[str, list[str]]:
+        """Admitted term names per equation, keyed `d{name}`, mirroring `SINDy.library_terms()`."""
+        n_out = self.w.shape[0]
+        names = var_names or _default_var_names(n_out, self.n_dims)
+        features = self.feature_names(var_names)
+        mask = np.asarray(self.mask)
+        return {
+            f"d{names[i]}": [n for n, ok in zip(features, mask[i]) if ok]
+            for i in range(n_out)
+        }
+
+    def n_terms(self) -> Int[Array, " n_out"]:
+        """Admitted term count per equation."""
+        return self.mask.sum(axis=1)
 
 
 class SymModel(eqx.Module):
@@ -109,6 +145,6 @@ class SymModel(eqx.Module):
         self.module_list = tuple(module_list)
 
     def __call__(
-        self, z: Float[Array, " n_dims"], t: Float[Array, ""] | None = None
-    ) -> Float[Array, " n_out"]:
+        self, z: Float[Array, "... n_dims"], t: Float[Array, ""] | None = None
+    ) -> Float[Array, "... n_out"]:
         return sum(module(z) for module in self.module_list)
