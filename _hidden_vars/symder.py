@@ -2,9 +2,9 @@
 
 Reference (`symder_ref/symder/symder/symder.py`) assumes observables *are*
 state slices and a `[visible | hidden]` latent layout. Here observables can be
-weighted sums of states (`Observation`), and the latent is `[states |
-controls]`, so pinning and the free/pinned split are derived from the
-observation matrix instead of assumed from position.
+weighted sums of states or controls (`Observation`), and the latent is
+`[states | controls]`, so pinning and the free/pinned split are derived from
+the observation matrix instead of assumed from position.
 """
 
 from collections.abc import Callable, Sequence
@@ -22,16 +22,18 @@ __all__ = ["Observation", "SymDerModel"]
 
 
 class Observation(eqx.Module):
-    """By-name observation map `x_obs = C @ z`, compiled to a matrix at construction.
+    """By-name observation map `x_obs = C @ [states | controls]`,
+    compiled to a matrix at construction.
 
-    `matrix` is a float array field and so *is* picked up by
-    `eqx.is_inexact_array` filtering -- training code that partitions a
-    `SymDerModel` into trainable/static must exclude it explicitly (e.g. a
-    custom filter spec), since it cannot be marked `static=True`: a jnp array
-    is unhashable and breaks under `jit`.
+    `matrix` is frozen by default (`trainable=False`): its weights are
+    stoichiometry fixed physics rather than free parameters, and mass
+    balance would constrain them anyway, so `__call__` stops the gradient
+    through it internally. There should be no control line in the observables
+    spec (even though it is measured) to not leak into gradients and loss.
 
     Building e.g.:
-        state_names=["S_S", "S_I", "X_S", "X_H", "X_A", "S_O", "S_NH"],
+        state_names=["S_S", "X_S", "X_H", "X_A", "S_O", "S_NH"],
+        control_names=["S_I"]
         observables={
             "COD":   {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},  # weighted sum
             "X_tot": ["X_H", "X_A"],                        # plain sum
@@ -39,22 +41,26 @@ class Observation(eqx.Module):
         }                                                   # no S_NH observation
     """
 
-    matrix: Float[Array, "n_obs n_states"]
+    matrix: Float[Array, "n_obs n_dims"]
     names: tuple[str, ...] = eqx.field(static=True)
     state_names: tuple[str, ...] = eqx.field(static=True)
+    control_names: tuple[str, ...] = eqx.field(static=True)
 
     def __init__(
         self,
         state_names: Sequence[str],
         observables: dict[str, dict[str, float] | Sequence[str] | str],
+        control_names: Sequence[str] = (),
     ):
         self.state_names = tuple(state_names)
+        self.control_names = tuple(control_names)
         self.names = tuple(observables.keys())
-        index = {name: i for i, name in enumerate(self.state_names)}
+        names = self.state_names + self.control_names
+        index = {name: i for i, name in enumerate(names)}
 
         rows = []
         for spec in observables.values():
-            row = np.zeros(len(self.state_names))
+            row = np.zeros(len(names))
             if isinstance(spec, dict):
                 for name, weight in spec.items():
                     row[index[name]] = weight
@@ -66,26 +72,31 @@ class Observation(eqx.Module):
             rows.append(row)
         self.matrix = jnp.asarray(np.stack(rows))
 
-    def __call__(self, z: Float[Array, "... n_states"]) -> Float[Array, "... n_obs"]:
-        """x_obs = C @ z, batch axes carried through."""
-        return jnp.einsum("...s,os->...o", z, self.matrix)
+    def __call__(self, y: Float[Array, "... n_dims"]) -> Float[Array, "... n_obs"]:
+        """x_obs = C @ y for the augmented latent y = [states | controls], batch axes carried through."""
+        matrix = jax.lax.stop_gradient(self.matrix)
+        return jnp.einsum("...d,od->...o", y, matrix)
 
     def unobserved_states(self) -> tuple[str, ...]:
-        """State names with an all-zero column in `matrix`: touched by no observable."""
-        zero = np.all(np.asarray(self.matrix) == 0, axis=0)
+        """State names (control columns excluded) with an all-zero column: touched by no observable."""
+        n_states = len(self.state_names)
+        zero = np.all(np.asarray(self.matrix)[:, :n_states] == 0, axis=0)
         return tuple(name for name, is_zero in zip(self.state_names, zero) if is_zero)
 
     def _pinned(self) -> list[tuple[int, int, float]]:
-        """Rows with exactly one nonzero weight: `(obs_idx, state_idx, weight)`.
+        """
+        Rows with exactly one nonzero state weight and no nonzero control weight:
+        `(obs_idx, state_idx, weight)`.
 
         Such a row measures its state directly (`z[s] = obs / w`), so that
         state can be pinned from data instead of inferred by the encoder.
         """
         matrix = np.asarray(self.matrix)
+        n_states = len(self.state_names)
         pinned = []
         for obs_idx, row in enumerate(matrix):
-            nonzero = np.flatnonzero(row)
-            if nonzero.size == 1:
+            nonzero = np.flatnonzero(row[:n_states])
+            if nonzero.size == 1 and not np.any(row[n_states:]):
                 pinned.append((obs_idx, int(nonzero[0]), float(row[nonzero[0]])))
         return pinned
 
@@ -154,7 +165,11 @@ class SymDerModel(eqx.Module):
 
         batch = v.shape[:-1]
         free_idx = jnp.asarray(self.free_idx, dtype=jnp.int32)
-        z = jnp.zeros(batch + (self.n_states,), dtype=v.dtype).at[..., free_idx].set(free)
+        z = (
+            jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
+            .at[..., free_idx]
+            .set(free)
+        )
         if self.pinned_idx:
             obs_idx = jnp.asarray(self.pinned_obs_idx, dtype=jnp.int32)
             pinned_idx = jnp.asarray(self.pinned_idx, dtype=jnp.int32)
@@ -164,7 +179,11 @@ class SymDerModel(eqx.Module):
         if dfree is None:
             return z, None
 
-        dzdt = jnp.zeros(batch + (self.n_states,), dtype=v.dtype).at[..., free_idx].set(dfree)
+        dzdt = (
+            jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
+            .at[..., free_idx]
+            .set(dfree)
+        )
         if self.pinned_idx:
             dzdt = dzdt.at[..., pinned_idx].set(dvdt[..., obs_idx] / weight)
         return z, dzdt
@@ -212,7 +231,7 @@ class SymDerModel(eqx.Module):
         """
         t = jnp.asarray(0.0) if t is None else t
         raw_derivs = self.field_derivatives(z, u, dudt, t)
-        outs = [self.observation(dy[..., : self.n_states]) for dy in raw_derivs]
+        outs = [self.observation(dy) for dy in raw_derivs]
         return jnp.stack(outs, axis=-1)
 
     def __call__(
@@ -236,27 +255,24 @@ class SymDerModel(eqx.Module):
         return sym_deriv, z, dzdt
 
 
+if __name__ == "__main__":
 
-if __name__ == '__main__':
-
-    state_names = ["S_S", "S_I", "X_S", "X_H", "X_A", "S_O", "S_NH"]
+    state_names = ["S_S", "S_I", "X_S", "X_H", "X_A", "S_NH"]
+    control_names = ["S_O"]
     observables = {
-        "COD":   {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},   # weighted sum
-        "X_tot": ["X_H", "X_A"],                          # plain sum, weights 1
-        "S_O":   "S_O",                                   # direct measurement
-        "X_S":   {"X_S": 2.0},
+        "COD": {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},  # weighted sum
+        "X_tot": ["X_H", "X_A"],    # plain sum, weights 1
+        "X_S": {"X_S": 2.0},        # direct measurement
     }
 
     obs_matrix = Observation(
-        state_names=state_names,
-        observables=observables
+        state_names=state_names, control_names=control_names, observables=observables
     )
 
-    z = jnp.ones((10,7)) * (jnp.arange(7) + 1)
-    matrix = obs_matrix.matrix 
+    z = jnp.ones((10, 7)) * (jnp.arange(7) + 1)
+    matrix = obs_matrix.matrix
     obss = obs_matrix(z)
     unob_states = obs_matrix.unobserved_states()
     pinned_states = obs_matrix._pinned()
 
     pass
-
