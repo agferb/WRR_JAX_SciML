@@ -62,7 +62,7 @@ class PolynomialLibrary(eqx.Module):
     trainable and an optimizer would silently update the indices.
     """
 
-    w: Float[Array, "n_out n_features"]
+    coeffs: Float[Array, "n_out n_features"]
     mask: Bool[Array, "n_out n_features"]
     idxm: Int[Array, "n_features max_degree"]
     n_dims: int = eqx.field(static=True)
@@ -77,15 +77,6 @@ class PolynomialLibrary(eqx.Module):
         self.n_dims = n_dims
         specs = [spec] * n_out if isinstance(spec, dict) else list(spec)
         normalised = [_normalise_spec(s, n_dims) for s in specs]
-        for s in normalised:
-            if s["interactions_degree"] is not None or (
-                s["var_interactions_degree"] is not None
-            ):
-                raise ValueError(
-                    "PolynomialLibrary is explicit-only; got a SINDy-PI "
-                    "interactions key ('interactions_degree' or "
-                    "'var_interactions_degree')"
-                )
 
         max_degree = max(s["degree"] for s in normalised)
         combos = _combos(n_dims, max_degree)
@@ -96,18 +87,18 @@ class PolynomialLibrary(eqx.Module):
         self.idxm = jnp.array(
             [c + (n_dims,) * (max_degree - len(c)) for c in combos], dtype=jnp.int32
         )
-        self.w = jnp.zeros((n_out, len(combos)))
+        self.coeffs = jnp.zeros((n_out, len(combos)))
 
     def __call__(
         self, z: Float[Array, "... n_dims"], t: Float[Array, ""] | None = None
     ) -> Float[Array, "... n_out"]:
-        y = jnp.concatenate([z, jnp.ones(z.shape[:-1] + (1,))], axis=-1)
-        theta = jnp.prod(y[..., self.idxm], axis=-1)
-        return jnp.einsum("...f,of->...o", theta, self.mask * self.w)
+        z_sentinel = jnp.concatenate([z, jnp.ones(z.shape[:-1] + (1,))], axis=-1)
+        theta = jnp.prod(z_sentinel[..., self.idxm], axis=-1)
+        return jnp.einsum("...f,of->...o", theta, self.mask * self.coeffs)
 
     def feature_names(self, var_names: list[str] | None = None) -> list[str]:
         """One name per column, e.g. "1", "x0", "x1*x2", recovered from `idxm`."""
-        n_out, n_dims = self.w.shape[0], self.n_dims
+        n_out, n_dims = self.coeffs.shape[0], self.n_dims
         names = var_names or _default_var_names(n_out, n_dims)
         return [
             "*".join(names[i] for i in row if i != n_dims) or "1"
@@ -116,7 +107,7 @@ class PolynomialLibrary(eqx.Module):
 
     def library_terms(self, var_names: list[str] | None = None) -> dict[str, list[str]]:
         """Admitted term names per equation, keyed `d{name}`, mirroring `SINDy.library_terms()`."""
-        n_out = self.w.shape[0]
+        n_out = self.coeffs.shape[0]
         names = var_names or _default_var_names(n_out, self.n_dims)
         features = self.feature_names(var_names)
         mask = np.asarray(self.mask)
@@ -148,3 +139,28 @@ class SymModel(eqx.Module):
         self, z: Float[Array, "... n_dims"], t: Float[Array, ""] | None = None
     ) -> Float[Array, "... n_out"]:
         return sum(module(z) for module in self.module_list)
+
+
+if __name__ == '__main__':
+
+    spec = {
+        "degree": 3,
+        "var_degree": (2, 1, 3),
+        "exclude": [(3, 0, 0), (0, 1, 2)],      
+        "bias": True,
+        }
+    
+    lib = PolynomialLibrary(
+        n_out=2,
+        spec=spec,
+        n_dims=3
+    )
+
+    coeffs = lib.coeffs
+    mask = lib.mask
+    idxm = lib.idxm
+
+    z = jnp.arange(30).reshape(10,3)
+    out = lib(z)
+
+    pass

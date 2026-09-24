@@ -168,10 +168,6 @@ def format_conditioning(report: dict) -> str:
     """Render one `conditioning()` report as a text table with spectrum and verdicts."""
     sigma, rank, n = report["sigma"], report["rank"], len(report["sigma"])
 
-    def bar(s: float) -> str:
-        digits = -jnp.log10(s) if s > 0 else 30.0
-        return "#" * min(int(digits), 40)
-
     around = range(max(0, rank - 2), min(n, rank + 2))
     shown = sorted(set(range(min(3, n))) | set(around) | {n - 1})
 
@@ -186,13 +182,18 @@ def format_conditioning(report: dict) -> str:
         f"kappa_normalised = {report['kappa_normalised']:.3e}",
         f"eps = {report['eps']:.3e}   kappa x eps = {report['kappa_eps']:.3e}   "
         f"digits_lost = {report['digits_lost']:.1f}",
-        "",
-        f"numerical rank cut-off:  {sigma[int(rank)-1]:.3e} -> {sigma[int(rank)]:.3e}",
     ]
+
+    if rank < n:
+        lines.append(
+            "",
+            f"numerical rank cut-off:  {sigma[int(rank)-1]:.3e} -> {sigma[int(rank)]:.3e}"
+        )
 
     if "settled" in report:
         s = report["settled"]
         lines.append(
+            ""
             f"settled samples (below 1% of peak derivative) = {s['fraction']:.1%}"
         )
         lines.append(f"settling index = {s['from']}")
