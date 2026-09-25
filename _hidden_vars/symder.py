@@ -42,7 +42,7 @@ class Observation(eqx.Module):
         }                                                   # no S_NH observation
     """
 
-    matrix: Float[Array, "n_obs n_variables"]
+    matrix: Float[Array, "n_obs n_dims"]
     names: tuple[str, ...] = eqx.field(static=True)
     state_names: tuple[str, ...] = eqx.field(static=True)
     control_names: tuple[str, ...] = eqx.field(static=True)
@@ -73,7 +73,7 @@ class Observation(eqx.Module):
             rows.append(row)
         self.matrix = jnp.asarray(np.stack(rows))
 
-    def __call__(self, z: Float[Array, "... n_variables"]) -> Float[Array, "... n_obs"]:
+    def __call__(self, z: Float[Array, "... n_dims"]) -> Float[Array, "... n_obs"]:
         """
         `y = C @ z` for the augmented latent `z = [x | u]`.
         Batch axes carried through.

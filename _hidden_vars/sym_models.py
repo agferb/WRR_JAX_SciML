@@ -43,7 +43,7 @@ def _combos(n_dims: int, max_degree: int) -> list[tuple[int, ...]]:
 
 
 def _default_var_names(n_out: int, n_dims: int) -> list[str]:
-    """`x0..x{n_out-1}` then `u0..`, matching `src/sindy.py`'s convention."""
+    """`x0..x{n_dims-1}` then `u0..`, matching `src/sindy.py`'s convention."""
     return [f"x{i}" for i in range(n_out)] + [f"u{j}" for j in range(n_dims - n_out)]
 
 
@@ -58,8 +58,8 @@ class PolynomialLibrary(eqx.Module):
     integer.
     """
 
-    coeffs: Float[Array, "n_out n_features"]
-    mask: Bool[Array, "n_out n_features"]
+    coeffs: Float[Array, "n_dims n_features"]
+    mask: Bool[Array, "n_dims n_features"]
     idxm: Int[Array, "n_features max_degree"]
     n_dims: int = eqx.field(static=True)
 
