@@ -65,13 +65,13 @@ class PolynomialLibrary(eqx.Module):
 
     def __init__(
         self,
-        n_out: int,
+        n_states: int,
         spec: dict | Sequence[dict],
-        n_dims: int | None = None,
+        n_controls: int = 0,
     ):
-        n_dims = n_out if n_dims is None else n_dims
+        n_dims = n_states + n_controls
         self.n_dims = n_dims
-        specs = [spec] * n_out if isinstance(spec, dict) else list(spec)
+        specs = [spec] * n_states if isinstance(spec, dict) else list(spec)
         normalised = [_normalise_spec(s, n_dims) for s in specs]
 
         max_degree = max(s["degree"] for s in normalised)
@@ -83,7 +83,7 @@ class PolynomialLibrary(eqx.Module):
         self.idxm = jnp.array(
             [c + (n_dims,) * (max_degree - len(c)) for c in combos], dtype=jnp.int32
         )
-        self.coeffs = jnp.zeros((n_out, len(combos)))
+        self.coeffs = jnp.zeros((n_states, len(combos)))
 
     def __call__(
         self, z: Float[Array, "... n_dims"], t: Float[Array, ""] | None = None
@@ -94,8 +94,8 @@ class PolynomialLibrary(eqx.Module):
 
     def feature_names(self, var_names: list[str] | None = None) -> list[str]:
         """One name per column, e.g. "1", "x0", "x1*x2", recovered from `idxm`."""
-        n_out, n_dims = self.coeffs.shape[0], self.n_dims
-        names = var_names or _default_var_names(n_out, n_dims)
+        n_states, n_dims = self.coeffs.shape[0], self.n_dims
+        names = var_names or _default_var_names(n_states, n_dims)
         return [
             "*".join(names[i] for i in row if i != n_dims) or "1"
             for row in np.asarray(self.idxm).tolist()
@@ -103,13 +103,13 @@ class PolynomialLibrary(eqx.Module):
 
     def library_terms(self, var_names: list[str] | None = None) -> dict[str, list[str]]:
         """Admitted term names per equation, keyed `d{name}`, mirroring `SINDy.library_terms()`."""
-        n_out = self.coeffs.shape[0]
-        names = var_names or _default_var_names(n_out, self.n_dims)
+        n_states = self.coeffs.shape[0]
+        names = var_names or _default_var_names(n_states, self.n_dims)
         features = self.feature_names(var_names)
         mask = np.asarray(self.mask)
         return {
             f"d{names[i]}": [n for n, ok in zip(features, mask[i]) if ok]
-            for i in range(n_out)
+            for i in range(n_states)
         }
 
     def n_terms(self) -> Int[Array, " n_out"]:
@@ -137,26 +137,47 @@ class SymModel(eqx.Module):
         return sum(module(z) for module in self.module_list)
 
 
-if __name__ == '__main__':
+class Encoder(eqx.Module):
+    """
+    Builds encoder based on provided list of layers.
+    """
+
+    layers: list
+
+    def __init__(self, layers: list):
+        self.layers = layers
+
+    def __call__(
+        self,
+        x: Float[Array, "... n_in_dims"],
+        t: Float[Array, ""] | None = None,
+    ) -> Float[Array, "... n_inferred"]:
+
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+if __name__ == "__main__":
 
     spec = {
         "degree": 3,
         "var_degree": (2, 1, 3),
-        "exclude": [(3, 0, 0), (0, 1, 2)],      
+        "exclude": [(3, 0, 0), (0, 1, 2)],
         "bias": True,
-        }
-    
+    }
+
     lib = PolynomialLibrary(
-        n_out=2,
+        n_states=2,
         spec=spec,
-        n_dims=3
+        n_controls=1,
     )
 
     coeffs = lib.coeffs
     mask = lib.mask
     idxm = lib.idxm
 
-    z = jnp.arange(30).reshape(10,3)
+    z = jnp.arange(30).reshape(10, 3)
     out = lib(z)
 
     pass

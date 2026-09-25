@@ -1,10 +1,11 @@
 """Observation map and the SymDer model, generalising `get_symder_apply`/`get_model_apply`.
 
 Reference (`symder_ref/symder/symder/symder.py`) assumes observables *are*
-state slices and a `[visible | hidden]` latent layout. Here observables can be
-weighted sums of states or controls (`Observation`), and the latent is
-`[states | controls]`, so the visible/lumped/hidden partition and the inferred
-set are derived from the observation matrix instead of assumed from position.
+state slices and a `[visible | hidden]` latent layout. Here observables (`y`)
+can be weighted sums of states (`x`) or controls (`u`) (`Observation`), and
+the augmented latent the symbolic library sees is `z = [x | u]`, so the
+visible/lumped/hidden partition and the inferred set are derived from the
+observation matrix instead of assumed from position.
 """
 
 from collections.abc import Callable, Sequence
@@ -22,7 +23,7 @@ __all__ = ["Observation", "SymDerModel"]
 
 
 class Observation(eqx.Module):
-    """By-name observation map `x_obs = C @ [states | controls]`,
+    """By-name observation map `y = C @ [x | u]`,
     compiled to a matrix at construction.
 
     `matrix` is frozen by default (`trainable=False`): its weights are
@@ -41,7 +42,7 @@ class Observation(eqx.Module):
         }                                                   # no S_NH observation
     """
 
-    matrix: Float[Array, "n_obs n_dims"]
+    matrix: Float[Array, "n_obs n_variables"]
     names: tuple[str, ...] = eqx.field(static=True)
     state_names: tuple[str, ...] = eqx.field(static=True)
     control_names: tuple[str, ...] = eqx.field(static=True)
@@ -72,13 +73,13 @@ class Observation(eqx.Module):
             rows.append(row)
         self.matrix = jnp.asarray(np.stack(rows))
 
-    def __call__(self, y: Float[Array, "... n_dims"]) -> Float[Array, "... n_obs"]:
+    def __call__(self, z: Float[Array, "... n_variables"]) -> Float[Array, "... n_obs"]:
         """
-        `x_obs = C @ y` for the augmented latent `y = [states | controls]`.
+        `y = C @ z` for the augmented latent `z = [x | u]`.
         Batch axes carried through.
         """
         matrix = jax.lax.stop_gradient(self.matrix)
-        return jnp.einsum("...d,od->...o", y, matrix)
+        return jnp.einsum("...d,od->...o", z, matrix)
 
     def visible_states(self) -> tuple[str, ...]:
         """
@@ -111,8 +112,8 @@ class Observation(eqx.Module):
         Rows with exactly one nonzero state weight and no nonzero control weight:
         `(obs_idx, state_idx, weight)`.
 
-        Such a row measures its state directly (`z[s] = obs / w`), so that
-        state is visible and can be read from data instead of inferred by the encoder.
+        Such a row measures its state directly (`x[s] = y / w`), so that state is
+        visible and can be read from data instead of inferred by the encoder.
         """
         matrix = np.asarray(self.matrix)
         n_states = len(self.state_names)
@@ -127,13 +128,15 @@ class Observation(eqx.Module):
 class SymDerModel(eqx.Module):
     """Encoder -> latent assembly -> symbolic derivative stack.
 
-    `encoder` is a plain callable `v -> inferred_states`, mapping the observed
-    series to the inferred (non-visible, when `pin_visible=True`) states only
-    -- last axis width `n_states - len(visible_idx)` -- and carrying its own
-    parameters as an Equinox submodule; this file does not define it.
+    `encoder` is a plain callable `v -> inferred_states`, mapping the
+    assembled encoder input `v = [y | u]` (last axis width `n_obs +
+    n_controls`) to the inferred (non-visible, when `pin_visible=True`)
+    states only -- last axis width `n_states - len(visible_idx)` -- and
+    carrying its own parameters as an Equinox submodule; this file does not
+    define it.
     """
 
-    encoder: Callable
+    encoder: eqx.Module
     sym_model: PolynomialLibrary | SymModel
     observation: Observation
     n_states: int = eqx.field(static=True)
@@ -146,7 +149,7 @@ class SymDerModel(eqx.Module):
 
     def __init__(
         self,
-        encoder: Callable,
+        encoder: eqx.Module,
         sym_model: PolynomialLibrary | SymModel,
         observation: Observation,
         n_states: int,
@@ -172,98 +175,115 @@ class SymDerModel(eqx.Module):
 
     def latent(
         self,
-        v: Float[Array, "... n_obs"],
-        dvdt: Float[Array, "... n_obs"] | None = None,
+        y: Float[Array, "... n_obs"],
+        dydt: Float[Array, "... n_obs"] | None = None,
+        u: Float[Array, "... n_controls"] | None = None,
+        dudt: Float[Array, "... n_controls"] | None = None,
     ) -> tuple[Float[Array, "... n_states"], Float[Array, "... n_states"] | None]:
         """Assemble the full state from visible measurements + encoder output;
-        `dzdt` only when `dvdt` is given.
+        `dxdt` only when `dydt` is given.
 
-        Visible states take `z = obs / w` and `dz/dt = dobs/dt / w` straight
-        from the data; the encoder JVP (run only when `dvdt is not None`)
-        supplies the inferred states and their derivative instead. Both groups
-        are scattered into their declared indices, not assumed contiguous.
+        Builds the encoder input `v = [y | u]` here (and `dvdt = [dydt | dudt]`
+        for the JVP) -- the only place either concatenation happens, so
+        `__call__` just forwards its own `y, dydt, u, dudt` through. Visible
+        states take `x = y_obs / w` and `dx/dt = dy_obs/dt / w` straight from
+        the observable block of `y`; `visible_obs_idx` indexes into `y`
+        (0..n_obs-1), which stays valid inside `v` only because `y` is
+        concatenated first -- do not reorder `[y | u]`. The encoder JVP (run
+        only when `dydt is not None`) supplies the inferred states and their
+        derivative instead. Both groups are scattered into their declared
+        indices, not assumed contiguous.
         """
-        if dvdt is None:
+        batch = y.shape[:-1]
+        u = jnp.zeros(batch + (self.n_controls,), dtype=y.dtype) if u is None else u
+        v = jnp.concatenate([y, u], axis=-1)
+
+        if dydt is None:
             inferred = self.encoder(v)
         else:
-            inferred, dinferred = jax.jvp(self.encoder, (v,), (dvdt,))
+            dudt = (
+                jnp.zeros(batch + (self.n_controls,), dtype=y.dtype)
+                if dudt is None
+                else dudt
+            )
+            dvdt = jnp.concatenate([dydt, dudt], axis=-1)
+            inferred, d_inferred = jax.jvp(self.encoder, (v,), (dvdt,))
 
-        batch = v.shape[:-1]
         inferred_idx = jnp.asarray(self.inferred_idx, dtype=jnp.int32)
-        z = (
-            jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
+        x = (
+            jnp.zeros(batch + (self.n_states,), dtype=y.dtype)
             .at[..., inferred_idx]
             .set(inferred)
         )
         if self.visible_idx:
             obs_idx = jnp.asarray(self.visible_obs_idx, dtype=jnp.int32)
             visible_idx = jnp.asarray(self.visible_idx, dtype=jnp.int32)
-            weight = jnp.asarray(self.visible_weight, dtype=v.dtype)
-            z = z.at[..., visible_idx].set(v[..., obs_idx] / weight)
+            weight = jnp.asarray(self.visible_weight, dtype=y.dtype)
+            x = x.at[..., visible_idx].set(y[..., obs_idx] / weight)
 
-        dzdt = None
-        if dvdt is not None:
-            dzdt = (
-                jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
+        dxdt = None
+        if dydt is not None:
+            dxdt = (
+                jnp.zeros(batch + (self.n_states,), dtype=y.dtype)
                 .at[..., inferred_idx]
-                .set(dinferred)
+                .set(d_inferred)
             )
             if self.visible_idx:
-                dzdt = dzdt.at[..., visible_idx].set(dvdt[..., obs_idx] / weight)
-        
-        return z, dzdt
+                dxdt = dxdt.at[..., visible_idx].set(dydt[..., obs_idx] / weight)
+
+        return x, dxdt
 
 
     def _field(
         self,
-        z: Float[Array, "... n_states"],
+        x: Float[Array, "... n_states"],
         dudt: Float[Array, "... n_controls"],
     ) -> tuple[Callable, PyTree]:
         """
-        Build `field(y, t, p) = concatenate([library(y), dudt], -1)` with `p` explicit, never closed over.
+        Build `field(z, t, p) = concatenate([library(z), dudt], -1)` with `p` explicit, never closed over.
         """
         trainable, static = eqx.partition(self.sym_model, eqx.is_inexact_array)
-        dudt = jnp.broadcast_to(dudt, z.shape[:-1] + (self.n_controls,))
+        dudt = jnp.broadcast_to(dudt, x.shape[:-1] + (self.n_controls,))
 
-        def field(y: Float[Array, "... n_dims"], t: Float[Array, ""], p: PyTree):
-            return jnp.concatenate([eqx.combine(p, static)(y), dudt], axis=-1)
+        def field(z: Float[Array, "... n_z"], t: Float[Array, ""], p: PyTree):
+            return jnp.concatenate([eqx.combine(p, static)(z), dudt], axis=-1)
 
         return field, trainable
 
     def field_derivatives(
         self,
-        z: Float[Array, "... n_states"],
+        x: Float[Array, "... n_states"],
         u: Float[Array, "... n_controls"],
         dudt: Float[Array, "... n_controls"],
         t: Float[Array, ""] | None = None,
-    ) -> list[Float[Array, "... n_dims"]]:
+    ) -> list[Float[Array, "... n_z"]]:
         """
-        [dy/dt, d^2y/dt^2] of the augmented latent `y = [z | u]` (`n_dims = n_states + n_controls`).
+        [dz/dt, d^2z/dt^2] of the augmented latent `z = [x | u]` (`n_z = n_states + n_controls`).
         """
         t = jnp.asarray(0.0) if t is None else t
-        field, trainable = self._field(z, dudt)
-        y0 = jnp.concatenate([z, u], axis=-1)
-        return [f(y0, t, trainable) for f in dfunc(field, 2)[1:]]
+        field, trainable = self._field(x, dudt)
+        z0 = jnp.concatenate([x, u], axis=-1)
+        return [f(z0, t, trainable) for f in dfunc(field, 2)[1:]]
 
     def obs_derivatives(
         self,
-        z: Float[Array, "... n_states"],
+        x: Float[Array, "... n_states"],
         u: Float[Array, "... n_controls"],
         dudt: Float[Array, "... n_controls"],
         t: Float[Array, ""] | None = None,
     ) -> Float[Array, "... n_obs 2"]:
         """
-        Stack [dx_obs/dt, d^2x_obs/dt^2]. Only valid for linear observations.
+        Stack [dy/dt, d^2y/dt^2]. Only valid for linear observations.
         """
         t = jnp.asarray(0.0) if t is None else t
-        raw_derivs = self.field_derivatives(z, u, dudt, t)
-        outs = [self.observation(dy) for dy in raw_derivs]
+        raw_derivs = self.field_derivatives(x, u, dudt, t)
+        outs = [self.observation(dz) for dz in raw_derivs]
         return jnp.stack(outs, axis=-1)
 
     def __call__(
         self,
-        v: Float[Array, "... n_obs"],
-        dvdt: Float[Array, "... n_obs"] | None = None,
+        y: Float[Array, "... n_obs"],
+        dydt: Float[Array, "... n_obs"] | None = None,
         u: Float[Array, "... n_controls"] | None = None,
         dudt: Float[Array, "... n_controls"] | None = None,
         t: Float[Array, ""] | None = None,
@@ -272,13 +292,13 @@ class SymDerModel(eqx.Module):
         Float[Array, "... n_states"],
         Float[Array, "... n_states"] | None,
     ]:
-        """Encode `v` to the latent, then predict [dx_obs/dt, d^2x_obs/dt^2] as `(sym_deriv, z, dzdt)`."""
-        batch = v.shape[:-1]
+        """Encode `v = [y | u]` to the latent, then predict [dy/dt, d^2y/dt^2] as `(sym_deriv, x, dxdt)`."""
+        batch = y.shape[:-1]
         u = jnp.zeros(batch + (self.n_controls,)) if u is None else u
         dudt = jnp.zeros(batch + (self.n_controls,)) if dudt is None else dudt
-        z, dzdt = self.latent(v, dvdt)
-        sym_deriv = self.obs_derivatives(z, u, dudt, t)
-        return sym_deriv, z, dzdt
+        x, dxdt = self.latent(y, dydt, u, dudt)
+        sym_deriv = self.obs_derivatives(x, u, dudt, t)
+        return sym_deriv, x, dxdt
 
 
 if __name__ == "__main__":
@@ -297,7 +317,7 @@ if __name__ == "__main__":
 
     z = jnp.ones((10, 7)) * (jnp.arange(7) + 1)
     matrix = obs_matrix.matrix
-    obss = obs_matrix(z)
+    y = obs_matrix(z)
     hidden_states = obs_matrix.hidden_states()
     lumped_states = obs_matrix.lumped_states()
     visible_states = obs_matrix.visible_states()
