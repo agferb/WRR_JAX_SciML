@@ -153,3 +153,100 @@ and the loss (`utils.py`).
   needs a test on each side.
 - Pinning propagates measurement noise directly into the latent state; that is what
   `pin_measured=False` is for.
+
+---
+
+## Appendix: two ways to use the measurement *values*
+
+The loss compares only *derivatives* of observables, so for a summed observable the
+measured **value** is never used. Nothing forces `C z = v`. Measured with an
+untrained encoder on `COD = S_S + S_I + 1.6*X_S`, `X_tot = X_H + X_A`:
+
+```
+C @ z  = [[-75.6, 66.1], ...]
+v      = [[100.0, 30.0], ...]     <- nothing forces these to agree
+```
+
+The only thing tying the latent's level to reality is the indirect requirement that
+the resulting dynamics reproduce the observed derivatives. Pinning fixes this for
+single-state rows; summed rows are left free. Two ways to close the gap.
+
+### Alternative 1: algebraic elimination (hard constraint)
+
+Per row, solve for one state instead of letting the encoder predict it. With `dep`
+the eliminated states, `free` the rest, `A = C[:, dep]`, `B = C[:, free]`:
+
+```
+z_dep    = A^-1 (v    - B z_free    - C_u u)
+dz_dep/dt = A^-1 (dv/dt - B dz_free/dt - C_u du/dt)
+```
+
+- The measurement holds **exactly** at every sample; verified `C @ z == v`.
+- The encoder produces `n_states - rank(C)` states instead of `n_states`: a
+  structural reduction in degrees of freedom (5 -> 3 in the example above).
+- **It subsumes pinning**: a single-state row makes `A` 1x1 and recovers today's
+  `z = obs / w`, so this replaces the pinned/free machinery rather than adding to it.
+- **It resolves the deferred control-offset case**: `u` is known, so a row mixing a
+  state and a control eliminates just as easily. No need to thread `u` into pinning.
+- Cost is slightly favourable: the encoder's last layer and its JVP narrow, against
+  two small matmuls with a precomputed `A^-1`.
+
+Risks:
+
+- **Measurement noise lands entirely on the eliminated state**, scaled by
+  `COD / (w * z)`. Measured on `COD = S_S + S_I + 1.6*X_S` with `S_S = 8`
+  (small) and `X_S = 40` (dominant):
+
+  | noise on COD | eliminate `S_S` | eliminate `X_S` |
+  |---|---|---|
+  | 2 % | 25.4 % relative, P(negative) 0.005 % | 3.2 %, 0 % |
+  | 5 % | 64.2 %, P(negative) 5.9 % | 8.0 %, 0 % |
+  | 10 % | 127.1 %, P(negative) 21.7 % | 15.9 %, 0 % |
+
+  **Always eliminate the dominant term.** This matters more than `cond(A)`, which
+  was 1.0 for both choices above and so blind to the difference.
+- A negative eliminated state is unphysical and, inside a Monod denominator
+  `K_S + S`, flips its sign -- the failure mode `monod_herbert_limitations.md`
+  records, where three sign-flipped samples took the derivative error from 16 % to
+  220 %.
+- Positivity cannot be enforced on eliminated states (the free ones can still use a
+  positive parameterisation, though `softplus` cannot represent an exact zero, and
+  Monod-Herbert starts at `x0 = [0, 15, 0]`).
+- Requires `rank(C) = n_obs`; redundant observables leave no invertible submatrix.
+- Measurement bias lands directly in the states; the encoder cannot absorb it.
+
+### Alternative 2: an MSE penalty on `||C z - v||` (soft constraint)
+
+Add a loss term comparing predicted observables to measured ones.
+
+| | elimination (hard) | MSE penalty (soft) |
+|---|---|---|
+| uses the measurement value | yes, exactly | yes, weighted |
+| degrees of freedom | `n_states - rank(C)` | unchanged (informational only) |
+| positivity | impossible for eliminated states | enforceable on all states |
+| per-sample noise | injected 1:1 into the state | encoder can average it over its window |
+| needs `rank(C) = n_obs` | yes | no |
+| choice of eliminated state | required, and consequential | none |
+| measurement uncertainty | implicitly zero | a weight per sensor |
+| new hyperparameter | no | yes, a weight |
+
+The last row is the principled argument: elimination asserts **infinite confidence**
+in every measurement, while a weighted penalty states COD to +-5 % and DO to +-1 %.
+Because the encoder sees a time window (delay embedding / conv receptive field), it
+can smooth noise across samples; an algebraic per-sample substitution cannot.
+
+### Recommendation
+
+**Start with the penalty.** It is one extra term in `utils.py`, where the loss
+already lives, so `symder.py` does not change, and it is reversible. There is
+precedent in the same file: `reg_dzdt` is exactly this pattern, a soft coupling
+between encoder and data.
+
+Then, once the residual `||C z - v||` can be seen to sit within measurement noise,
+consider elimination for rows where it is safe -- a dominant eliminated component and
+a well-conditioned `A`. A hybrid is legitimate: eliminate the safe rows, penalise
+the rest.
+
+Watch the weight early in training, when the encoder is arbitrary and `||C z - v||`
+is large (the `-75.6` vs `100.0` above). Normalising each observable by its scale, or
+warming the weight up, will matter more than its final value.

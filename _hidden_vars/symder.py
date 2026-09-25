@@ -160,8 +160,10 @@ class SymDerModel(eqx.Module):
         supplies the free states and their derivative instead. Both groups
         are scattered into their declared indices, not assumed contiguous.
         """
-        free = self.encoder(v)
-        dfree = None if dvdt is None else jax.jvp(self.encoder, (v,), (dvdt,))[1]
+        if dvdt is None:
+            free = self.encoder(v)
+        else:
+            free, dfree = jax.jvp(self.encoder, (v,), (dvdt,))
 
         batch = v.shape[:-1]
         free_idx = jnp.asarray(self.free_idx, dtype=jnp.int32)
@@ -176,17 +178,18 @@ class SymDerModel(eqx.Module):
             weight = jnp.asarray(self.pinned_weight, dtype=v.dtype)
             z = z.at[..., pinned_idx].set(v[..., obs_idx] / weight)
 
-        if dfree is None:
-            return z, None
-
-        dzdt = (
-            jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
-            .at[..., free_idx]
-            .set(dfree)
-        )
-        if self.pinned_idx:
-            dzdt = dzdt.at[..., pinned_idx].set(dvdt[..., obs_idx] / weight)
+        dzdt = None
+        if dvdt is not None:
+            dzdt = (
+                jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
+                .at[..., free_idx]
+                .set(dfree)
+            )
+            if self.pinned_idx:
+                dzdt = dzdt.at[..., pinned_idx].set(dvdt[..., obs_idx] / weight)
+        
         return z, dzdt
+
 
     def _field(
         self,
