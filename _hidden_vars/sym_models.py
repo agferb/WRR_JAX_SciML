@@ -3,8 +3,6 @@
 `PolynomialLibrary` gives the same nested library control as `src/sindy.py`
 (`degree`, `var_degree`, `exclude`, `bias`) over a flat, gather-based feature
 vector; `SymModel` sums an arbitrary list of such terms into one vector field.
-This no longer mirrors the reference's per-degree Haiku modules -- diverging
-structurally from `symder_ref` is accepted here.
 """
 
 import itertools
@@ -56,10 +54,8 @@ class PolynomialLibrary(eqx.Module):
     padded with the sentinel `n_dims`, which points at a constant `1.0` appended
     to the input; the empty combo (the bias) is all sentinels, so it evaluates
     to 1 with no special case. `mask` (bool) and `idxm` (int) are skipped by
-    `eqx.is_inexact_array` filtering, so only `w` trains; neither could be
-    `static=True` anyway, since a jnp array is unhashable -- only the plain int
-    `n_dims` can. `idxm` must stay an integer dtype: as a float it would be
-    trainable and an optimizer would silently update the indices.
+    `eqx.is_inexact_array` filtering, so only `w` trains. `idxm` dtype must be
+    integer.
     """
 
     coeffs: Float[Array, "n_out n_features"]

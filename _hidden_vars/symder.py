@@ -3,8 +3,8 @@
 Reference (`symder_ref/symder/symder/symder.py`) assumes observables *are*
 state slices and a `[visible | hidden]` latent layout. Here observables can be
 weighted sums of states or controls (`Observation`), and the latent is
-`[states | controls]`, so pinning and the free/pinned split are derived from
-the observation matrix instead of assumed from position.
+`[states | controls]`, so the visible/lumped/hidden partition and the inferred
+set are derived from the observation matrix instead of assumed from position.
 """
 
 from collections.abc import Callable, Sequence
@@ -36,7 +36,7 @@ class Observation(eqx.Module):
         control_names=["S_I"]
         observables={
             "COD":   {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},  # weighted sum
-            "X_tot": ["X_H", "X_A"],                        # plain sum
+            "X_tot": ["X_S", "X_H", "X_A"],                 # plain sum
             "S_O":   "S_O",                                 # direct measurement
         }                                                   # no S_NH observation
     """
@@ -73,41 +73,64 @@ class Observation(eqx.Module):
         self.matrix = jnp.asarray(np.stack(rows))
 
     def __call__(self, y: Float[Array, "... n_dims"]) -> Float[Array, "... n_obs"]:
-        """x_obs = C @ y for the augmented latent y = [states | controls], batch axes carried through."""
+        """
+        `x_obs = C @ y` for the augmented latent `y = [states | controls]`.
+        Batch axes carried through.
+        """
         matrix = jax.lax.stop_gradient(self.matrix)
         return jnp.einsum("...d,od->...o", y, matrix)
 
-    def unobserved_states(self) -> tuple[str, ...]:
-        """State names (control columns excluded) with an all-zero column: touched by no observable."""
+    def visible_states(self) -> tuple[str, ...]:
+        """
+        State names directly observed in data: they appear alone in at least one row.
+        """
+        idx = {s for _, s, _ in self._visible()}
+        return tuple(name for i, name in enumerate(self.state_names) if i in idx)
+
+    def lumped_states(self) -> tuple[str, ...]:
+        """
+        State names lumped into at least one observable but not directly measured.
+        """
+        n_states = len(self.state_names)
+        touched = np.any(np.asarray(self.matrix)[:, :n_states] != 0, axis=0)
+        visible = set(self.visible_states())
+        return tuple(
+            name
+            for name, is_touched in zip(self.state_names, touched)
+            if is_touched and name not in visible
+        )
+
+    def hidden_states(self) -> tuple[str, ...]:
+        """State names not observed at all through observables."""
         n_states = len(self.state_names)
         zero = np.all(np.asarray(self.matrix)[:, :n_states] == 0, axis=0)
         return tuple(name for name, is_zero in zip(self.state_names, zero) if is_zero)
 
-    def _pinned(self) -> list[tuple[int, int, float]]:
+    def _visible(self) -> list[tuple[int, int, float]]:
         """
         Rows with exactly one nonzero state weight and no nonzero control weight:
         `(obs_idx, state_idx, weight)`.
 
         Such a row measures its state directly (`z[s] = obs / w`), so that
-        state can be pinned from data instead of inferred by the encoder.
+        state is visible and can be read from data instead of inferred by the encoder.
         """
         matrix = np.asarray(self.matrix)
         n_states = len(self.state_names)
-        pinned = []
+        visible = []
         for obs_idx, row in enumerate(matrix):
             nonzero = np.flatnonzero(row[:n_states])
             if nonzero.size == 1 and not np.any(row[n_states:]):
-                pinned.append((obs_idx, int(nonzero[0]), float(row[nonzero[0]])))
-        return pinned
+                visible.append((obs_idx, int(nonzero[0]), float(row[nonzero[0]])))
+        return visible
 
 
 class SymDerModel(eqx.Module):
     """Encoder -> latent assembly -> symbolic derivative stack.
 
-    `encoder` is a plain callable `v -> free_states`, mapping the observed
-    series to the free (non-pinned) states only -- last axis width
-    `n_states - n_pinned` -- and carrying its own parameters as an Equinox
-    submodule; this file does not define it.
+    `encoder` is a plain callable `v -> inferred_states`, mapping the observed
+    series to the inferred (non-visible, when `pin_visible=True`) states only
+    -- last axis width `n_states - len(visible_idx)` -- and carrying its own
+    parameters as an Equinox submodule; this file does not define it.
     """
 
     encoder: Callable
@@ -115,11 +138,11 @@ class SymDerModel(eqx.Module):
     observation: Observation
     n_states: int = eqx.field(static=True)
     n_controls: int = eqx.field(static=True)
-    pin_measured: bool = eqx.field(static=True)
-    pinned_idx: tuple[int, ...] = eqx.field(static=True)
-    pinned_obs_idx: tuple[int, ...] = eqx.field(static=True)
-    pinned_weight: tuple[float, ...] = eqx.field(static=True)
-    free_idx: tuple[int, ...] = eqx.field(static=True)
+    pin_visible: bool = eqx.field(static=True)
+    visible_idx: tuple[int, ...] = eqx.field(static=True)
+    visible_obs_idx: tuple[int, ...] = eqx.field(static=True)
+    visible_weight: tuple[float, ...] = eqx.field(static=True)
+    inferred_idx: tuple[int, ...] = eqx.field(static=True)
 
     def __init__(
         self,
@@ -128,65 +151,65 @@ class SymDerModel(eqx.Module):
         observation: Observation,
         n_states: int,
         n_controls: int = 0,
-        pin_measured: bool = True,
+        pin_visible: bool = True,
     ):
         self.encoder = encoder
         self.sym_model = sym_model
         self.observation = observation
         self.n_states = n_states
         self.n_controls = n_controls
-        self.pin_measured = pin_measured
+        self.pin_visible = pin_visible
 
-        pinned = (
-            observation._pinned()
-            if pin_measured and isinstance(observation, Observation)
+        visible = (
+            observation._visible()
+            if pin_visible and isinstance(observation, Observation)
             else []
         )
-        self.pinned_obs_idx = tuple(o for o, _, _ in pinned)
-        self.pinned_idx = tuple(s for _, s, _ in pinned)
-        self.pinned_weight = tuple(w for _, _, w in pinned)
-        self.free_idx = tuple(i for i in range(n_states) if i not in self.pinned_idx)
+        self.visible_obs_idx = tuple(o for o, _, _ in visible)
+        self.visible_idx = tuple(s for _, s, _ in visible)
+        self.visible_weight = tuple(w for _, _, w in visible)
+        self.inferred_idx = tuple(i for i in range(n_states) if i not in self.visible_idx)
 
     def latent(
         self,
         v: Float[Array, "... n_obs"],
         dvdt: Float[Array, "... n_obs"] | None = None,
     ) -> tuple[Float[Array, "... n_states"], Float[Array, "... n_states"] | None]:
-        """Assemble the full state from pinned measurements + encoder output;
+        """Assemble the full state from visible measurements + encoder output;
         `dzdt` only when `dvdt` is given.
 
-        Pinned states take `z = obs / w` and `dz/dt = dobs/dt / w` straight
+        Visible states take `z = obs / w` and `dz/dt = dobs/dt / w` straight
         from the data; the encoder JVP (run only when `dvdt is not None`)
-        supplies the free states and their derivative instead. Both groups
+        supplies the inferred states and their derivative instead. Both groups
         are scattered into their declared indices, not assumed contiguous.
         """
         if dvdt is None:
-            free = self.encoder(v)
+            inferred = self.encoder(v)
         else:
-            free, dfree = jax.jvp(self.encoder, (v,), (dvdt,))
+            inferred, dinferred = jax.jvp(self.encoder, (v,), (dvdt,))
 
         batch = v.shape[:-1]
-        free_idx = jnp.asarray(self.free_idx, dtype=jnp.int32)
+        inferred_idx = jnp.asarray(self.inferred_idx, dtype=jnp.int32)
         z = (
             jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
-            .at[..., free_idx]
-            .set(free)
+            .at[..., inferred_idx]
+            .set(inferred)
         )
-        if self.pinned_idx:
-            obs_idx = jnp.asarray(self.pinned_obs_idx, dtype=jnp.int32)
-            pinned_idx = jnp.asarray(self.pinned_idx, dtype=jnp.int32)
-            weight = jnp.asarray(self.pinned_weight, dtype=v.dtype)
-            z = z.at[..., pinned_idx].set(v[..., obs_idx] / weight)
+        if self.visible_idx:
+            obs_idx = jnp.asarray(self.visible_obs_idx, dtype=jnp.int32)
+            visible_idx = jnp.asarray(self.visible_idx, dtype=jnp.int32)
+            weight = jnp.asarray(self.visible_weight, dtype=v.dtype)
+            z = z.at[..., visible_idx].set(v[..., obs_idx] / weight)
 
         dzdt = None
         if dvdt is not None:
             dzdt = (
                 jnp.zeros(batch + (self.n_states,), dtype=v.dtype)
-                .at[..., free_idx]
-                .set(dfree)
+                .at[..., inferred_idx]
+                .set(dinferred)
             )
-            if self.pinned_idx:
-                dzdt = dzdt.at[..., pinned_idx].set(dvdt[..., obs_idx] / weight)
+            if self.visible_idx:
+                dzdt = dzdt.at[..., visible_idx].set(dvdt[..., obs_idx] / weight)
         
         return z, dzdt
 
@@ -260,12 +283,12 @@ class SymDerModel(eqx.Module):
 
 if __name__ == "__main__":
 
-    state_names = ["S_S", "S_I", "X_S", "X_H", "X_A", "S_NH"]
-    control_names = ["S_O"]
+    state_names = ["S_S", "X_S", "X_H", "X_A", "S_O", "S_NH"]
+    control_names = ["S_I"]
     observables = {
-        "COD": {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},  # weighted sum
-        "X_tot": ["X_H", "X_A"],    # plain sum, weights 1
-        "X_S": {"X_S": 2.0},        # direct measurement
+        "COD": {"S_S": 1.0, "S_I": 1.0, "X_S": 1.6},
+        "X_tot": ["X_S", "X_H", "X_A"],
+        "S_O": "S_O",
     }
 
     obs_matrix = Observation(
@@ -275,7 +298,9 @@ if __name__ == "__main__":
     z = jnp.ones((10, 7)) * (jnp.arange(7) + 1)
     matrix = obs_matrix.matrix
     obss = obs_matrix(z)
-    unob_states = obs_matrix.unobserved_states()
-    pinned_states = obs_matrix._pinned()
+    hidden_states = obs_matrix.hidden_states()
+    lumped_states = obs_matrix.lumped_states()
+    visible_states = obs_matrix.visible_states()
+    _vis = obs_matrix._visible()
 
     pass
