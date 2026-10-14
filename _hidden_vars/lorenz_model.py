@@ -166,7 +166,7 @@ if __name__ == "__main__":
         ),
         jax.nn.relu,
         eqx.nn.Conv1d(
-            in_channels=n_in_dims,
+            in_channels=layer_sizes[1],
             out_channels=n_inferred,
             kernel_size=1,
             padding="VALID",

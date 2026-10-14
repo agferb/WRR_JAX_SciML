@@ -153,9 +153,13 @@ class Encoder(eqx.Module):
         t: Float[Array, ""] | None = None,
     ) -> Float[Array, "... n_inferred"]:
 
+        # Transform to ndim = 2 and transpose
+        y = x.reshape(x.shape[-1], x.shape[-2])
         for layer in self.layers:
-            x = layer(x)
-        return x
+            y = layer(y)
+        
+        # Return back the original ndim and orientation
+        return y.T.reshape((1,) * (x.ndim - 2) + y.T.shape)
 
 
 if __name__ == "__main__":
