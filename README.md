@@ -34,7 +34,6 @@ python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 
 | Path | What's in it |
 |---|---|
-| `src/models.py` | `Autoencoder` and parameter-counting helpers |
 | `src/ude.py` | UDE vector fields, the Diffrax `solve` wrapper, multiple shooting, `freeze_mechanistic` |
 | `src/sindy.py` | `SINDy` class: per-equation libraries with five levels of control (total degree, per-variable degree, term exclusions, derivative interactions, per-variable interaction degree), control variables, jittable STLSQ (Lineax solves), the SINDy-PI parallel-implicit sweep, candidate scoring and rational-form recovery |
 | `src/sindy_utils.py` | Helpers behind `SINDy`: the jittable STLSQ solver (Lineax least squares, masked pruning, optional column/target normalisation) and conditioning diagnostics (`conditioning`/`format_conditioning`: column scale, singular spectrum, numerical rank, condition number), plus library-spec normalisation |
@@ -42,7 +41,7 @@ python -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 | `examples/lotka_volterra_ude.py` | Full pipeline: fit a UDE, then recover its closure symbolically |
 | `examples/michaelis_menten_sindy_pi.py` | SINDy-PI: recover a rational ODE that no explicit library can represent |
 | `examples/monod_herbert.py` | SINDy-PI on a rational Monod-Herbert model: an oversized, poorly conditioned library where recovery fails in float32 and succeeds in float64 -- prints a conditioning report before solving |
-| `tests/` | `test_sindy.py`, `test_ude.py`, `test_models.py` — a small suite chosen by mutation testing: each test pins a decision a future edit could reverse |
+| `tests/` | `test_sindy.py`, `test_ude.py` — a small suite chosen by mutation testing: each test pins a decision a future edit could reverse |
 
 ## The worked examples
 
