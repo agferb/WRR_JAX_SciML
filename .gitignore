@@ -10,6 +10,7 @@ CLAUDED.MD
 *.egg-info/
 build/
 dist/
+.env
 
 .vscode/
 
