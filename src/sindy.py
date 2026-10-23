@@ -77,6 +77,16 @@ class SINDy:
             interaction monomial. It does not inherit from `var_degree` -- the
             two families have independent caps.
 
+    Alternatively, a spec may list its terms outright:
+
+        {"full_library": [(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1)]}
+
+    (vii)   `full_library` admits exactly the exponent vectors listed, written as
+            in `exclude` (trailing derivative slot optional) but without the
+            `True`/`inf` wildcards. Every other key in the spec is ignored, so
+            the bias term must be listed as the all-zeros vector to be kept.
+            Per-equation lists may mix `full_library` specs with regular ones.
+
     All tuples in defining the library must have lenght `n_variables` = `n_states`
     + `n_controls`. Check `library_terms()` before solving if a fit looks off.
     DO NOT use `exclude` to drop the bias term; set `bias=False` instead.

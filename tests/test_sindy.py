@@ -219,6 +219,59 @@ def test_unknown_library_keys_and_bad_shapes_are_rejected():
         sindy.SINDy(n_states=3, library=[{"degree": 2}, {"degree": 1}])
 
 
+def test_full_library_admits_exactly_the_listed_terms():
+    terms = [(0, 0, 0), (1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1)]
+    model = sindy.SINDy(n_states=2, library={"full_library": terms}, implicit=True)
+    assert allowed_terms(model) == ["1", "x0", "x0*x1", "dx_k", "x0*dx_k"]
+
+    # every other key is ignored, bias included
+    noisy = sindy.SINDy(
+        n_states=2,
+        library={"full_library": terms, "degree": 1, "bias": False,
+                 "exclude": [(1, 0, 0)], "interactions_degree": 0},
+        implicit=True,
+    )
+    assert allowed_terms(noisy) == allowed_terms(model)
+    assert "1" not in allowed_terms(
+        sindy.SINDy(n_states=2, library={"full_library": [(1, 0), (0, 2)]})
+    )
+
+    # and it mixes with regular specs per equation
+    mixed = sindy.SINDy(
+        n_states=2, library=[{"full_library": [(0, 2)]}, {"degree": 1}]
+    )
+    terms_by_eq = mixed.library_terms()
+    assert terms_by_eq["dx0"] == ["x1*x1"]
+    assert terms_by_eq["dx1"] == ["1", "x0", "x1"]
+
+
+def test_full_library_recovers_a_known_system():
+    X, dX = known_system(200)
+    model = sindy.SINDy(
+        n_states=2,
+        library=[{"full_library": [(1, 0, 0), (1, 1, 0)]},
+                 {"full_library": [(0, 1, 0), (0, 0, 1)]}],
+        n_controls=1,
+        var_names=["x", "z", "u"],
+    )
+    xi = model.solve(X, dX)
+    names = model.feature_names
+    assert xi[names.index("x"), 0] == pytest.approx(-2.0, abs=1e-3)
+    assert xi[names.index("x*z"), 0] == pytest.approx(3.0, abs=1e-3)
+    assert xi[names.index("u"), 1] == pytest.approx(1.0, abs=1e-3)
+    assert bool(jnp.all(jnp.abs(xi.T[~model.library_mask]) == 0.0))
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [(True, 0), (jnp.inf, 0), (1, 0, 2), (1, 0, 0, 0), (-1, 0)],
+    ids=["true-wildcard", "inf-wildcard", "deriv-squared", "too-long", "negative"],
+)
+def test_full_library_rejects_bad_entries(entry):
+    with pytest.raises(ValueError, match="full_library"):
+        sindy.SINDy(n_states=2, library={"full_library": [entry]})
+
+
 # --- the STLSQ solver -------------------------------------------------------
 
 

@@ -22,6 +22,7 @@ _SPEC_KEYS = {
     "bias",
     "interactions_degree",
     "var_interactions_degree",
+    "full_library",
 }
 
 
@@ -243,8 +244,63 @@ def _expand_exclusion(
     return list(itertools.product(*ranges))
 
 
+def _spec_from_full_library(terms: list[tuple[int, ...]], n_vars: int) -> dict:
+    """
+    Rewrite an explicit term list as the canonical spec admitting exactly it.
+
+    The degree caps are the largest totals listed, and `exclude` is every other
+    term under those caps, so `SINDy._allows` needs no special case.
+    """
+
+    if not terms:
+        raise ValueError("`full_library` must list at least one term")
+    padded = set()
+    for entry in terms:
+        if len(entry) > n_vars + 1:
+            raise ValueError(
+                f"`full_library` entry {entry} is longer than n_variables + 1"
+            )
+        # wildcards unfold up to a degree cap, which an explicit list has none of
+        if any(isinstance(p, bool) or not isinstance(p, int) or p < 0 for p in entry):
+            raise ValueError(
+                f"`full_library` entry {entry} must hold non-negative ints only"
+            )
+        vec = tuple(entry) + (0,) * (n_vars + 1 - len(entry))
+        if vec[-1] > 1:
+            raise ValueError(f"`full_library` entry {entry} has a derivative power > 1")
+        padded.add(vec)
+
+    pure = [sum(v[:-1]) for v in padded if not v[-1]]
+    deriv = [sum(v[:-1]) for v in padded if v[-1]]
+    degree = max(pure, default=0)
+    interactions_degree = max(deriv, default=None)
+
+    # every term the caps alone would admit, as exponent vectors
+    caps = [(degree, 0)]
+    if interactions_degree is not None:
+        caps.append((interactions_degree, 1))
+    candidates = {
+        tuple(combo.count(i) for i in range(n_vars)) + (d_slot,)
+        for cap, d_slot in caps
+        for d in range(cap + 1)
+        for combo in itertools.combinations_with_replacement(range(n_vars), d)
+    }
+
+    return {
+        "degree": degree,
+        "var_degree": None,
+        "interactions_degree": interactions_degree,
+        "var_interactions_degree": None,
+        "bias": (0,) * (n_vars + 1) in padded,
+        "exclude": candidates - padded,
+    }
+
+
 def _normalise_spec(spec: dict, n_vars: int) -> dict:
-    """Fill a library spec's optional keys and pad `exclude` to `n_vars + 1`."""
+    """
+    Fill a library spec's optional keys and pad `exclude` to `n_vars + 1`.
+    A `full_library` spec ignores every other key.
+    """
 
     unknown = set(spec) - _SPEC_KEYS
     if unknown:
@@ -252,6 +308,8 @@ def _normalise_spec(spec: dict, n_vars: int) -> dict:
             f"unknown library key(s) {sorted(unknown)}; "
             f"expected any of {sorted(_SPEC_KEYS)}"
         )
+    if "full_library" in spec:
+        return _spec_from_full_library(spec["full_library"], n_vars)
     normalised = {
         "degree": spec["degree"],
         "var_degree": spec.get("var_degree"),
